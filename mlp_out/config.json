@@ -1,0 +1,38 @@
+{
+  "split_dir": ".\\alpamayo_dataset\\data\\split",
+  "out": "mlp_out",
+  "epochs": 300,
+  "batch_size": 512,
+  "lr": 0.002,
+  "weight_decay": 0.0001,
+  "dropout": 0.1,
+  "hidden": [
+    1024,
+    256
+  ],
+  "patience": 30,
+  "seed": 42,
+  "compile": false,
+  "num_workers": 0,
+  "load_workers": 8,
+  "rebuild_cache": false,
+  "balance": true,
+  "lat_thresh": 1.0,
+  "n_train": 49426,
+  "n_val": 14084,
+  "n_test": 7049,
+  "best_val_loss": 0.04894019845630831,
+  "test_loss": 0.04878253569216876,
+  "predict_idx": [
+    0,
+    2,
+    3,
+    4
+  ],
+  "weight_names": [
+    "long_pos",
+    "heading",
+    "steer_rate",
+    "accel_rate"
+  ]
+}

@@ -1,0 +1,9 @@
+/alpamayo_1.5_weights/*
+CLAUDE.md
+/.claude
+/alpamayo_dataset/data/
+/alpamayo_dataset/viz_out_tqf/
+
+*.ply
+*.usdz
+*.asl
