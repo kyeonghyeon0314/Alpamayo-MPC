@@ -48,7 +48,7 @@ import torch
 # 공유 MPC 모듈 / 시각화 유틸 / MLP 모델 임포트 (같은 디렉토리)
 sys.path.insert(0, str(Path(__file__).parent))
 from mpc import run_mpc, WEIGHTS_DEFAULT, W_LAT_FIXED, N, DT, NX, IX, IY
-from viz_mpc_label import _set_traj_limits
+from viz_mpc_label import _set_traj_limits, _comfort_metrics
 from model import CotendMLP, PREDICT_IDX, load_mlp
 
 
@@ -116,32 +116,48 @@ def plot_mlp_single(h5_path: Path, model: CotendMLP, device: torch.device, out_d
         xy_opt = U_opt = None
         ade_opt = float("nan")
 
+    # ── Comfort metrics ───────────────────────────────
+    sr_mlp, jr_mlp = _comfort_metrics(U_mlp)
+    sr_def, jr_def = _comfort_metrics(U_def)
+    if has_opt:
+        sr_opt, jr_opt = _comfort_metrics(U_opt)
+
+    t_diff = t_axis[:-1]   # N-1 midpoints for diff-based plots
+
     # ── Figure 구성 ───────────────────────────────────
-    fig = plt.figure(figsize=(16, 8))
-    title_parts = [
-        f"{h5_path.name}",
-        f"v0={v0:.1f} m/s",
-        f"MLP ADE={ade_mlp:.3f}m",
-    ]
-    if has_opt:
-        title_parts.append(f"Opt ADE={ade_opt:.3f}m (stored={ade_stored:.3f}m)")
-    title_parts.append(f"Default ADE={ade_def:.3f}m")
-    fig.suptitle("  |  ".join(title_parts), fontsize=9)
+    # Layout: 4 rows × 3 cols
+    #   col 0 (all rows) : trajectory
+    #   row 0, col 1-2   : ADE per-step error  (wide)
+    #   row 1, col 1     : steer command
+    #   row 1, col 2     : accel command
+    #   row 2, col 1     : steer rate  |Δsteer|
+    #   row 2, col 2     : jerk        |Δaccel|
+    #   row 3, col 1-2   : MPC weight bar chart (wide)
+    fig = plt.figure(figsize=(16, 11))
 
-    gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.55, wspace=0.35)
+    mlp_line = f"MLP  ADE={ade_mlp:.3f}m  SR={sr_mlp:.4f}  Jerk={jr_mlp:.4f}"
+    def_line = f"Def  ADE={ade_def:.3f}m  SR={sr_def:.4f}  Jerk={jr_def:.4f}"
+    opt_line = (f"Opt  ADE={ade_opt:.3f}m  SR={sr_opt:.4f}  Jerk={jr_opt:.4f}"
+                f"  (stored={ade_stored:.3f}m)" if has_opt else "")
+    fig.suptitle(
+        f"{h5_path.name}   v0={v0:.1f} m/s\n"
+        + "   |   ".join(filter(None, [opt_line, mlp_line, def_line])),
+        fontsize=9,
+    )
 
-    # ── 궤적 (좌열) ──────────────────────────────────
+    gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.60, wspace=0.35)
+
+    # ── trajectory (col 0) ──────────────────────────────
     ax_traj = fig.add_subplot(gs[:, 0])
-    ax_traj.plot(gt_xy[:, 1],   gt_xy[:, 0],   "g-",   lw=2.5, label="GT")
+    ax_traj.plot(gt_xy[:, 1], gt_xy[:, 0], "g-",  lw=2.5, label="GT")
     if has_opt:
-        ax_traj.plot(xy_opt[:, 1], xy_opt[:, 0], "b--",  lw=1.8,
+        ax_traj.plot(xy_opt[:, 1], xy_opt[:, 0], "b--", lw=1.8,
                      label=f"Opt  ADE={ade_opt:.3f}m")
-    ax_traj.plot(xy_mlp[:, 1],  xy_mlp[:, 0],  "m-.",  lw=1.8,
+    ax_traj.plot(xy_mlp[:, 1], xy_mlp[:, 0], "m-.", lw=1.8,
                  label=f"MLP  ADE={ade_mlp:.3f}m")
-    ax_traj.plot(xy_def[:, 1],  xy_def[:, 0],  "r:",   lw=1.5,
+    ax_traj.plot(xy_def[:, 1], xy_def[:, 0], "r:",  lw=1.5,
                  label=f"Def  ADE={ade_def:.3f}m")
     ax_traj.scatter([0], [0], c="k", s=50, zorder=5, label="t0")
-
     all_xy = [gt_xy, xy_mlp, xy_def] + ([xy_opt] if has_opt else [])
     _set_traj_limits(ax_traj, *all_xy)
     ax_traj.set_xlabel("Y / lateral [m]")
@@ -150,28 +166,28 @@ def plot_mlp_single(h5_path: Path, model: CotendMLP, device: torch.device, out_d
     ax_traj.legend(loc="best", fontsize=7)
     ax_traj.grid(True, ls=":", lw=0.5)
 
-    # ── 스텝별 거리 오차 (중상) ──────────────────────
-    ax_err = fig.add_subplot(gs[0, 1])
+    # ── ADE per-step error (row 0, cols 1-2) ────────────
+    ax_err = fig.add_subplot(gs[0, 1:3])
     if has_opt:
         err_opt = np.linalg.norm(xy_opt - gt_xy, axis=1)
         ax_err.plot(t_axis, err_opt, "b--", lw=1.5, label=f"Opt  {err_opt.mean():.3f}m")
     err_mlp = np.linalg.norm(xy_mlp - gt_xy, axis=1)
     err_def = np.linalg.norm(xy_def - gt_xy, axis=1)
-    ax_err.plot(t_axis, err_mlp, "m-.",  lw=1.5, label=f"MLP  {err_mlp.mean():.3f}m")
-    ax_err.plot(t_axis, err_def, "r:",   lw=1.3, label=f"Def  {err_def.mean():.3f}m")
+    ax_err.plot(t_axis, err_mlp, "m-.", lw=1.5, label=f"MLP  {err_mlp.mean():.3f}m")
+    ax_err.plot(t_axis, err_def, "r:",  lw=1.3, label=f"Def  {err_def.mean():.3f}m")
     ax_err.set_xlabel("Time [s]")
     ax_err.set_ylabel("||pred - GT|| [m]")
-    ax_err.set_title("Per-step displacement error")
+    ax_err.set_title("Per-step displacement error  (ADE = mean)")
     ax_err.legend(fontsize=7)
     ax_err.grid(True, ls=":", lw=0.5)
     ax_err.set_ylim(bottom=0)
 
-    # ── Steering 제어 입력 (중중) ────────────────────
+    # ── Steer command (row 1, col 1) ────────────────────
     ax_steer = fig.add_subplot(gs[1, 1])
     if has_opt:
-        ax_steer.plot(t_axis, U_opt[:, 0], "b--",  lw=1.5, label="steer (opt)")
-    ax_steer.plot(t_axis, U_mlp[:, 0], "m-.", lw=1.5, label="steer (mlp)")
-    ax_steer.plot(t_axis, U_def[:, 0], "r:",  lw=1.3, label="steer (def)")
+        ax_steer.plot(t_axis, U_opt[:, 0], "b--", lw=1.5, label="opt")
+    ax_steer.plot(t_axis, U_mlp[:, 0], "m-.", lw=1.5, label="mlp")
+    ax_steer.plot(t_axis, U_def[:, 0], "r:",  lw=1.3, label="def")
     ax_steer.axhline(0, c="k", lw=0.5, ls="--")
     ax_steer.set_xlabel("Time [s]")
     ax_steer.set_ylabel("Steering [rad]")
@@ -179,12 +195,12 @@ def plot_mlp_single(h5_path: Path, model: CotendMLP, device: torch.device, out_d
     ax_steer.legend(fontsize=7)
     ax_steer.grid(True, ls=":", lw=0.5)
 
-    # ── Acceleration 제어 입력 (중하) ────────────────
-    ax_accel = fig.add_subplot(gs[2, 1])
+    # ── Accel command (row 1, col 2) ────────────────────
+    ax_accel = fig.add_subplot(gs[1, 2])
     if has_opt:
-        ax_accel.plot(t_axis, U_opt[:, 1], "b--",  lw=1.5, label="accel (opt)")
-    ax_accel.plot(t_axis, U_mlp[:, 1], "m-.", lw=1.5, label="accel (mlp)")
-    ax_accel.plot(t_axis, U_def[:, 1], "r:",  lw=1.3, label="accel (def)")
+        ax_accel.plot(t_axis, U_opt[:, 1], "b--", lw=1.5, label="opt")
+    ax_accel.plot(t_axis, U_mlp[:, 1], "m-.", lw=1.5, label="mlp")
+    ax_accel.plot(t_axis, U_def[:, 1], "r:",  lw=1.3, label="def")
     ax_accel.axhline(0, c="k", lw=0.5, ls="--")
     ax_accel.set_xlabel("Time [s]")
     ax_accel.set_ylabel("Accel [m/s²]")
@@ -192,13 +208,45 @@ def plot_mlp_single(h5_path: Path, model: CotendMLP, device: torch.device, out_d
     ax_accel.legend(fontsize=7)
     ax_accel.grid(True, ls=":", lw=0.5)
 
-    # ── 가중치 막대 비교 (우열) ──────────────────────
-    ax_w = fig.add_subplot(gs[:, 2])
-    labels_w = ["long\npos", "lat\npos\n(fixed)", "heading", "steer\nrate", "accel\nrate"]
+    # ── Steer rate |Δsteer| (row 2, col 1) ──────────────
+    ax_sr = fig.add_subplot(gs[2, 1])
+    if has_opt:
+        ax_sr.plot(t_diff, np.abs(np.diff(U_opt[:, 0])), "b--", lw=1.5,
+                   label=f"opt  rms={sr_opt:.4f}")
+    ax_sr.plot(t_diff, np.abs(np.diff(U_mlp[:, 0])), "m-.", lw=1.5,
+               label=f"mlp  rms={sr_mlp:.4f}")
+    ax_sr.plot(t_diff, np.abs(np.diff(U_def[:, 0])), "r:",  lw=1.3,
+               label=f"def  rms={sr_def:.4f}")
+    ax_sr.set_xlabel("Time [s]")
+    ax_sr.set_ylabel("|Δsteer| [rad/step]")
+    ax_sr.set_title("Steering rate  |Δsteer|")
+    ax_sr.legend(fontsize=7)
+    ax_sr.grid(True, ls=":", lw=0.5)
+    ax_sr.set_ylim(bottom=0)
+
+    # ── Jerk |Δaccel| (row 2, col 2) ────────────────────
+    ax_jerk = fig.add_subplot(gs[2, 2])
+    if has_opt:
+        ax_jerk.plot(t_diff, np.abs(np.diff(U_opt[:, 1])), "b--", lw=1.5,
+                     label=f"opt  rms={jr_opt:.4f}")
+    ax_jerk.plot(t_diff, np.abs(np.diff(U_mlp[:, 1])), "m-.", lw=1.5,
+                 label=f"mlp  rms={jr_mlp:.4f}")
+    ax_jerk.plot(t_diff, np.abs(np.diff(U_def[:, 1])), "r:",  lw=1.3,
+                 label=f"def  rms={jr_def:.4f}")
+    ax_jerk.set_xlabel("Time [s]")
+    ax_jerk.set_ylabel("|Δaccel| [(m/s²)/step]")
+    ax_jerk.set_title("Jerk  |Δaccel|")
+    ax_jerk.legend(fontsize=7)
+    ax_jerk.grid(True, ls=":", lw=0.5)
+    ax_jerk.set_ylim(bottom=0)
+
+    # ── MPC weight bar (row 3, cols 1-2) ────────────────
+    ax_w = fig.add_subplot(gs[3, 1:3])
+    labels_w = ["long pos", "lat pos\n(fixed)", "heading", "steer rate", "accel rate"]
     x = np.arange(len(labels_w))
 
     n_bars  = 3 if has_opt else 2
-    width   = 0.25 if has_opt else 0.35
+    width   = 0.22 if has_opt else 0.35
     offsets = np.linspace(-width, width, n_bars)
 
     bar_items = []

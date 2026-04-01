@@ -42,7 +42,7 @@ import matplotlib.gridspec as gridspec
 import numpy as np
 import torch
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).parent.parent / "alpamayo_dataset"))
 from mpc import (
     run_mpc, step_dynamics, WEIGHTS_DEFAULT,
     N, DT, NX, IX, IY, IYAW, IVX, V_MIN_LIN,
@@ -158,17 +158,22 @@ def run_pcl_simulation(
     global_yaw:       np.ndarray,   # (N_frames,)
     model:            CotendMLP,
     device:           torch.device,
+    ema_alpha:        float = 1.0,  # EMA 평활화 계수 (1.0=비활성, 0<α<1=평활화)
 ) -> dict:
     """
     Receding Horizon PCL 시뮬레이션.
 
     MLP 가중치 / Default 가중치 두 가지를 동시에 시뮬레이션한다.
 
+    ema_alpha: EMA 계수. w_ema = alpha * w_raw + (1-alpha) * w_prev
+               1.0이면 평활화 없음 (원래 동작). 낮을수록 강한 평활화.
+
     Returns:
         xy_mlp_global  (N_frames, 2) : MLP-PCL 시뮬 전역 위치
         xy_def_global  (N_frames, 2) : Def-PCL 시뮬 전역 위치
         xy_gt_global   (N_frames, 2) : GT 전역 위치 (= global_origin_xy)
-        w_mlp_hist     (N_frames, 5) : 매 스텝 MLP 예측 가중치
+        w_mlp_hist     (N_frames, 5) : 매 스텝 EMA 평활화된 MLP 가중치 (MPC 실입력)
+        w_raw_hist     (N_frames, 5) : 매 스텝 MLP 원본 예측 가중치
         u_mlp_hist     (N_frames, 2) : 매 스텝 MLP 제어 입력
         u_def_hist     (N_frames, 2) : 매 스텝 Default 제어 입력
         errors_mlp     (N_frames,)   : GT 대비 MLP-PCL 위치 오차 [m]
@@ -184,11 +189,14 @@ def run_pcl_simulation(
 
     xy_mlp_global = np.zeros((N_frames, 2))
     xy_def_global = np.zeros((N_frames, 2))
-    w_mlp_hist    = np.zeros((N_frames, 5))
+    w_mlp_hist    = np.zeros((N_frames, 5))   # EMA 평활화된 가중치 (실제 MPC 입력)
+    w_raw_hist    = np.zeros((N_frames, 5))   # MLP 원본 예측 가중치
     u_mlp_hist    = np.zeros((N_frames, 2))
     u_def_hist    = np.zeros((N_frames, 2))
     vx_mlp_hist   = np.zeros(N_frames)
     vx_def_hist   = np.zeros(N_frames)
+
+    w_ema: np.ndarray | None = None  # EMA 상태 (첫 프레임은 raw 값으로 초기화)
 
     for i in range(N_frames):
         origin = global_origin_xy[i]
@@ -218,9 +226,15 @@ def run_pcl_simulation(
             x_def_l[IX], x_def_l[IY], x_def_l[IYAW],
         )
 
-        # ④ MLP 가중치 예측
-        w_mlp = _predict_weights(model, cotend[i], device)
-        w_mlp_hist[i] = w_mlp
+        # ④ MLP 가중치 예측 + EMA 평활화
+        w_raw = _predict_weights(model, cotend[i], device)
+        if w_ema is None:
+            w_ema = w_raw.copy()            # 첫 프레임: EMA 상태 초기화
+        else:
+            w_ema = ema_alpha * w_raw + (1.0 - ema_alpha) * w_ema
+        w_raw_hist[i]  = w_raw
+        w_mlp_hist[i]  = w_ema             # MPC에는 평활화된 가중치 사용
+        w_mlp = w_ema
 
         # ⑤ MPC 풀기 (MLP / Default)
         #    x0_full 제공 시 run_mpc 내부에서 position/heading을 0으로 정규화
@@ -249,7 +263,8 @@ def run_pcl_simulation(
         "xy_mlp_global": xy_mlp_global,
         "xy_def_global": xy_def_global,
         "xy_gt_global":  xy_gt_global,
-        "w_mlp_hist":    w_mlp_hist,
+        "w_mlp_hist":    w_mlp_hist,    # EMA 평활화된 가중치 (실제 MPC 입력)
+        "w_raw_hist":    w_raw_hist,    # MLP 원본 예측 가중치
         "u_mlp_hist":    u_mlp_hist,
         "u_def_hist":    u_def_hist,
         "vx_mlp_hist":   vx_mlp_hist,
@@ -260,217 +275,348 @@ def run_pcl_simulation(
 
 
 # ══════════════════════════════════════════════════════════════
-# 시각화
+# 시각화 유틸리티
 # ══════════════════════════════════════════════════════════════
 
-def plot_pcl_result(
-    clip_id:      str,
-    times_s:      np.ndarray,
-    result:       dict,
-    front_frames: np.ndarray | None,
-    out_dir:      Path,
-    v0_arr:       np.ndarray | None = None,
-    valid_mask:   np.ndarray | None = None,
+def _valid_slice(valid_mask: np.ndarray | None, n: int) -> slice:
+    """유효 구간 슬라이스 반환 (open-loop 테일 제거)."""
+    if valid_mask is None or not valid_mask.any():
+        return slice(0, n)
+    return slice(0, int(np.where(valid_mask)[0][-1]) + 1)
+
+
+# ══════════════════════════════════════════════════════════════
+# Fig 1 — 오차 타임라인 + BEV 궤적
+# ══════════════════════════════════════════════════════════════
+
+def plot_fig1_overview(
+    clip_id:    str,
+    times_s:    np.ndarray,
+    result:     dict,
+    out_dir:    Path,
+    valid_mask: np.ndarray | None = None,
 ) -> Path:
-    """PCL 시뮬레이션 결과 시각화 저장 (PNG)."""
+    """Fig 1: 오차 타임라인 + ADE/FDE 바 + BEV 궤적."""
     xy_mlp  = result["xy_mlp_global"]
     xy_def  = result["xy_def_global"]
     xy_gt   = result["xy_gt_global"]
     err_mlp = result["errors_mlp"]
     err_def = result["errors_def"]
-    w_mlp   = result["w_mlp_hist"]
-    u_mlp   = result["u_mlp_hist"]
-    u_def   = result["u_def_hist"]
 
-    # ── valid_mask: open-loop 구간 제외 ─────────────────────
-    if valid_mask is None:
-        valid_mask = np.ones(len(times_s), dtype=bool)
-    # 유효 구간은 연속된 앞부분만 사용 (중간 구멍 무시)
-    last_valid = int(np.where(valid_mask)[0][-1]) + 1 if valid_mask.any() else len(valid_mask)
-    sl = slice(0, last_valid)   # 유효 슬라이스
+    sl         = _valid_slice(valid_mask, len(times_s))
+    last_valid = sl.stop
+    ade_mlp    = float(np.mean(err_mlp[1:last_valid]))
+    ade_def    = float(np.mean(err_def[1:last_valid]))
+    fde_mlp    = float(err_mlp[last_valid - 1])
+    fde_def    = float(err_def[last_valid - 1])
+    gain_pct   = (ade_def - ade_mlp) / ade_def * 100 if ade_def > 0 else 0.0
 
-    ade_mlp  = float(np.mean(err_mlp[1:last_valid]))   # step 0는 항상 0 — 제외
-    ade_def  = float(np.mean(err_def[1:last_valid]))
-    fde_mlp  = float(err_mlp[last_valid - 1])
-    fde_def  = float(err_def[last_valid - 1])
-    gain_pct = (ade_def - ade_mlp) / ade_def * 100 if ade_def > 0 else 0.0
-
-    has_frames = front_frames is not None and len(front_frames) > 0
-
-    # ─── 레이아웃 구성 ───────────────────────────────────────
-    n_rows      = (5 if has_frames else 4)
-    row_heights = ([0.9] if has_frames else []) + [1.3, 1.0, 1.0, 2.8]
-    fig = plt.figure(figsize=(22, 4.5 * n_rows))
+    fig = plt.figure(figsize=(20, 14))
     fig.suptitle(
-        f"PCL Simulation  |  {clip_id}\n"
-        f"MLP-PCL  ADE={ade_mlp:.3f}m  FDE={fde_mlp:.3f}m    "
-        f"Def-PCL  ADE={ade_def:.3f}m  FDE={fde_def:.3f}m    "
+        f"[Fig 1] PCL Overview  |  {clip_id}\n"
+        f"MLP  ADE={ade_mlp:.3f}m  FDE={fde_mlp:.3f}m    "
+        f"Default  ADE={ade_def:.3f}m  FDE={fde_def:.3f}m    "
         f"impr={gain_pct:+.1f}%    "
-        f"clip duration {times_s[-1] - times_s[0]:.1f}s  ({len(times_s)} frames)",
-        fontsize=10, y=0.995,
+        f"clip {times_s[-1] - times_s[0]:.1f}s ({len(times_s)} frames)",
+        fontsize=12,
     )
-    outer = gridspec.GridSpec(n_rows, 1, figure=fig,
-                              height_ratios=row_heights, hspace=0.55)
-    row = 0
+    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.42, wspace=0.32,
+                           height_ratios=[1, 1.6])
 
-    # ── 전방 카메라 그리드 ────────────────────────────────────
-    if has_frames:
-        N_CAM   = min(10, len(front_frames))
-        indices = np.linspace(0, len(front_frames) - 1, N_CAM, dtype=int)
-        cmap_t  = plt.cm.plasma(np.linspace(0.1, 0.95, N_CAM))
-        gs_cam  = gridspec.GridSpecFromSubplotSpec(1, N_CAM, subplot_spec=outer[row], wspace=0.03)
-        for col, (idx, color) in enumerate(zip(indices, cmap_t)):
-            ax = fig.add_subplot(gs_cam[col])
-            ax.imshow(front_frames[idx])
-            for spine in ax.spines.values():
-                spine.set_edgecolor(color[:3])
-                spine.set_linewidth(3)
-            ax.set_title(f"t={times_s[idx]:.1f}s", fontsize=7, pad=2)
-            ax.axis("off")
-        row += 1
-
-    # ── 오차 타임라인 + ADE 요약 바 ──────────────────────────
-    gs_err = gridspec.GridSpecFromSubplotSpec(
-        1, 2, subplot_spec=outer[row], wspace=0.32, width_ratios=[2.8, 1]
-    )
     t_valid  = times_s[1:last_valid]
     em_valid = err_mlp[1:last_valid]
     ed_valid = err_def[1:last_valid]
 
-    ax_err = fig.add_subplot(gs_err[0])
+    # ── 오차 타임라인 ──────────────────────────────────────────
+    ax_err = fig.add_subplot(gs[0, 0])
     ax_err.plot(t_valid, em_valid, "-",  color="mediumpurple", lw=2.2,
-                label=f"MLP-PCL  ADE={ade_mlp:.3f}m  FDE={fde_mlp:.3f}m")
-    ax_err.plot(t_valid, ed_valid, "--", color="tomato",       lw=2.0,
-                label=f"Def-PCL   ADE={ade_def:.3f}m  FDE={fde_def:.3f}m")
-    ax_err.fill_between(
-        t_valid, em_valid, ed_valid,
-        where=(em_valid < ed_valid),
-        alpha=0.15, color="mediumpurple", label="MLP better",
-    )
-    ax_err.fill_between(
-        t_valid, em_valid, ed_valid,
-        where=(em_valid > ed_valid),
-        alpha=0.12, color="tomato", label="Default better",
-    )
-    ax_err.set_xlabel("Clip time [s]")
-    ax_err.set_ylabel("Position error vs GT [m]")
-    ax_err.set_title("PCL Position Error Timeline  (lower = better, flat = no divergence)")
-    ax_err.legend(fontsize=8, loc="upper left")
+                label=f"MLP-PCL  ADE={ade_mlp:.3f}m")
+    ax_err.plot(t_valid, ed_valid, "--", color="tomato", lw=2.0,
+                label=f"Def-PCL  ADE={ade_def:.3f}m")
+    ax_err.fill_between(t_valid, em_valid, ed_valid,
+                        where=(em_valid < ed_valid), alpha=0.15,
+                        color="mediumpurple", label="MLP better")
+    ax_err.fill_between(t_valid, em_valid, ed_valid,
+                        where=(em_valid > ed_valid), alpha=0.12,
+                        color="tomato", label="Default better")
+    ax_err.set_xlabel("Clip time [s]", fontsize=11)
+    ax_err.set_ylabel("Position error vs GT [m]", fontsize=11)
+    ax_err.set_title("Position Error Timeline  (lower = better)", fontsize=12)
+    ax_err.legend(fontsize=10)
     ax_err.grid(True, ls=":", lw=0.5)
     ax_err.set_ylim(bottom=0)
 
-    ax_bar = fig.add_subplot(gs_err[1])
-    bars = ax_bar.bar(
-        ["MLP-PCL", "Def-PCL"],
-        [ade_mlp, ade_def],
-        color=["mediumpurple", "tomato"],
-        alpha=0.85, edgecolor="white", width=0.5,
-    )
-    for bar, val in zip(bars, [ade_mlp, ade_def]):
-        ax_bar.text(
-            bar.get_x() + bar.get_width() / 2,
-            val + 0.01, f"{val:.3f}m",
-            ha="center", va="bottom", fontsize=10, fontweight="bold",
-        )
-    ax_bar.set_ylabel("Mean ADE [m]  (step 0 excluded)")
-    ax_bar.set_title(f"ADE Summary\nimpr={gain_pct:+.1f}%")
+    # ── ADE / FDE 요약 바 (그룹형) ────────────────────────────
+    ax_bar = fig.add_subplot(gs[0, 1])
+    x = np.arange(2)
+    bw = 0.32
+    b_ade = ax_bar.bar(x - bw / 2, [ade_mlp, ade_def], bw,
+                       color=["mediumpurple", "tomato"], alpha=0.85,
+                       edgecolor="white", label="ADE")
+    b_fde = ax_bar.bar(x + bw / 2, [fde_mlp, fde_def], bw,
+                       color=["mediumpurple", "tomato"], alpha=0.5,
+                       edgecolor="white", hatch="//", label="FDE")
+    for bar, val in zip(list(b_ade) + list(b_fde),
+                        [ade_mlp, ade_def, fde_mlp, fde_def]):
+        ax_bar.text(bar.get_x() + bar.get_width() / 2, val + 0.005,
+                    f"{val:.3f}", ha="center", va="bottom",
+                    fontsize=9, fontweight="bold")
+    ax_bar.set_xticks(x)
+    ax_bar.set_xticklabels(["MLP-PCL", "Def-PCL"], fontsize=11)
+    ax_bar.set_ylabel("Error [m]", fontsize=11)
+    ax_bar.set_title(f"ADE / FDE Summary  (impr={gain_pct:+.1f}%)", fontsize=12)
+    ax_bar.legend(fontsize=10)
     ax_bar.grid(True, axis="y", ls=":", lw=0.5)
-    row += 1
 
-    # ── MLP 가중치 진화 ──────────────────────────────────────
-    gs_w = gridspec.GridSpecFromSubplotSpec(1, 5, subplot_spec=outer[row], wspace=0.38)
-    for k, (wname, w_def_val) in enumerate(zip(_W_NAMES, WEIGHTS_DEFAULT)):
-        ax_w = fig.add_subplot(gs_w[k])
-        ax_w.plot(times_s, w_mlp[:, k], "-", color="mediumpurple", lw=1.5, label="MLP")
-        ax_w.axhline(w_def_val, color="tomato", ls="--", lw=1.2,
-                     label=f"def={w_def_val:.2f}")
-        ax_w.set_title(wname, fontsize=8)
-        ax_w.set_xlabel("t [s]", fontsize=7)
-        ax_w.legend(fontsize=6, loc="best")
-        ax_w.grid(True, ls=":", lw=0.5)
-    row += 1
-
-    # ── 제어 입력 (조향 / 가속) ──────────────────────────────
-    gs_u = gridspec.GridSpecFromSubplotSpec(1, 3, subplot_spec=outer[row], wspace=0.35)
-
-    ax_steer = fig.add_subplot(gs_u[0])
-    ax_steer.plot(times_s[sl], u_mlp[sl, 0], "-",  color="mediumpurple", lw=1.5, label="MLP")
-    ax_steer.plot(times_s[sl], u_def[sl, 0], "--", color="tomato",       lw=1.5, label="Def")
-    ax_steer.axhline(0, c="k", lw=0.5)
-    ax_steer.set_xlabel("t [s]"); ax_steer.set_ylabel("Steering cmd [rad]")
-    ax_steer.set_title("Steering Control Input")
-    ax_steer.legend(fontsize=8); ax_steer.grid(True, ls=":", lw=0.5)
-
-    ax_accel = fig.add_subplot(gs_u[1])
-    ax_accel.plot(times_s[sl], u_mlp[sl, 1], "-",  color="mediumpurple", lw=1.5, label="MLP")
-    ax_accel.plot(times_s[sl], u_def[sl, 1], "--", color="tomato",       lw=1.5, label="Def")
-    ax_accel.axhline(0, c="k", lw=0.5)
-    ax_accel.set_xlabel("t [s]"); ax_accel.set_ylabel("Accel cmd [m/s²]")
-    ax_accel.set_title("Acceleration Control Input")
-    ax_accel.legend(fontsize=8); ax_accel.grid(True, ls=":", lw=0.5)
-
-    vx_mlp = result["vx_mlp_hist"]
-    vx_def = result["vx_def_hist"]
-    ax_speed = fig.add_subplot(gs_u[2])
-    if v0_arr is not None:
-        ax_speed.plot(times_s[sl], v0_arr[sl], "-", color="gray", lw=1.5,
-                      alpha=0.6, label="GT v0", zorder=3)
-    ax_speed.plot(times_s[sl], vx_mlp[sl], "-",  color="mediumpurple", lw=1.5, label="MLP")
-    ax_speed.plot(times_s[sl], vx_def[sl], "--", color="tomato",       lw=1.5, label="Def")
-    ax_speed.set_xlabel("t [s]"); ax_speed.set_ylabel("Speed [m/s]")
-    ax_speed.set_title("Vehicle Speed")
-    ax_speed.legend(fontsize=8); ax_speed.grid(True, ls=":", lw=0.5)
-
-    row += 1
-
-    # ── 전역 궤적 (BEV) ──────────────────────────────────────
-    ax_traj = fig.add_subplot(outer[row])
-
-    # GT — 얇고 반투명하게, 기준선 역할만
+    # ── BEV 궤적 ──────────────────────────────────────────────
+    ax_traj = fig.add_subplot(gs[1, :])
     ax_traj.plot(xy_gt[sl, 1],  xy_gt[sl, 0],  "-",
-                 color="#888888", lw=1.2, alpha=0.5, zorder=3,
+                 color="#888888", lw=1.2, alpha=0.6, zorder=3,
                  label="GT (ground truth)")
-
-    # MLP-PCL
     ax_traj.plot(xy_mlp[sl, 1], xy_mlp[sl, 0], "-",
-                 color="mediumpurple", lw=2.2, zorder=5,
+                 color="mediumpurple", lw=2.5, zorder=5,
                  label=f"MLP-PCL  ADE={ade_mlp:.3f}m  FDE={fde_mlp:.3f}m")
-
-    # Default-PCL
     ax_traj.plot(xy_def[sl, 1], xy_def[sl, 0], "--",
-                 color="tomato", lw=2.0, alpha=0.85, zorder=4,
-                 label=f"Def-PCL   ADE={ade_def:.3f}m  FDE={fde_def:.3f}m")
-
-    # 시작 / 끝 마커
+                 color="tomato", lw=2.2, alpha=0.85, zorder=4,
+                 label=f"Def-PCL  ADE={ade_def:.3f}m  FDE={fde_def:.3f}m")
     ax_traj.scatter([xy_gt[0, 1]], [xy_gt[0, 0]],
-                    c="black", s=160, zorder=10,
-                    marker="o", edgecolors="white", linewidths=2.0, label="Start (common)")
-    for xy_arr, color, lbl in [
-        (xy_gt[sl],   "black",        "GT end"),
-        (xy_mlp[sl],  "mediumpurple", "MLP end"),
-        (xy_def[sl],  "tomato",       "Def end"),
+                    c="black", s=200, zorder=10, marker="o",
+                    edgecolors="white", linewidths=2.5, label="Start")
+    # GT end — 작은 속빈 다이아몬드 (MLP/Def end 아래 묻히지 않도록 zorder 높임)
+    ax_traj.scatter([xy_gt[sl][-1, 1]], [xy_gt[sl][-1, 0]],
+                    s=70, zorder=12, marker="D",
+                    facecolors="none", edgecolors="black", linewidths=2.0,
+                    label="GT end")
+    # MLP / Def end — 큰 별 마커
+    for xy_arr, clr, lbl in [
+        (xy_mlp[sl], "mediumpurple", "MLP end"),
+        (xy_def[sl], "tomato",       "Def end"),
     ]:
         ax_traj.scatter([xy_arr[-1, 1]], [xy_arr[-1, 0]],
-                        c=color, s=150, zorder=10,
-                        marker="*", edgecolors="white", linewidths=1.5, label=lbl)
-
-    ax_traj.set_xlabel("Y / lateral [m]   (<- left | right ->)")
-    ax_traj.set_ylabel("X / longitudinal [m]")
+                        c=clr, s=200, zorder=11, marker="*",
+                        edgecolors="white", linewidths=2.0, label=lbl)
+    status_mlp = "[!] MLP diverged" if fde_mlp > 10.0 else "[ok] MLP stable"
+    status_def = "[!] Def diverged" if fde_def > 10.0 else "[ok] Def stable"
+    ax_traj.set_xlabel("Y / lateral [m]  (<- left | right ->)", fontsize=11)
+    ax_traj.set_ylabel("X / longitudinal [m]", fontsize=11)
     ax_traj.set_title(
-        "Global Trajectory (BEV)   "
-        "dark=GT  |  purple solid=MLP-PCL  |  red dashed=Def-PCL\n"
-        f"star=clip end position   impr={gain_pct:+.1f}%"
-        + (f"   [!] MLP diverge" if fde_mlp > 10.0 else "   [ok] MLP stable")
-        + (f"   [!] Def diverge" if fde_def > 10.0 else "   [ok] Def stable"),
-    )
+        f"Global Trajectory (BEV)  —  {status_mlp}   {status_def}", fontsize=12)
     ax_traj.invert_xaxis()
-    ax_traj.legend(fontsize=8, loc="best", ncol=2)
+    ax_traj.legend(fontsize=10, loc="best", ncol=3)
     ax_traj.grid(True, ls=":", lw=0.5)
     ax_traj.set_aspect("equal", adjustable="datalim")
 
-    # ── 저장 ─────────────────────────────────────────────────
-    out_path = out_dir / f"{clip_id[:16]}_pcl_sim.png"
+    out_path = out_dir / f"{clip_id[:16]}_fig1_overview.png"
     fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+# ══════════════════════════════════════════════════════════════
+# Fig 2 — MLP 가중치 진화 (2×3 크게)
+# ══════════════════════════════════════════════════════════════
+
+def plot_fig2_weights(
+    clip_id: str,
+    times_s: np.ndarray,
+    result:  dict,
+    out_dir: Path,
+) -> Path:
+    """Fig 2: MLP 가중치 5개 진화 + Default 비교 바."""
+    w_mlp = result["w_mlp_hist"]
+
+    fig, axes = plt.subplots(2, 3, figsize=(22, 12))
+    fig.suptitle(f"[Fig 2] MLP Weight Evolution  |  {clip_id}", fontsize=13)
+
+    for k, (wname, w_def_val) in enumerate(zip(_W_NAMES, WEIGHTS_DEFAULT)):
+        row, col = divmod(k, 3)
+        ax    = axes[row, col]
+        wvals = w_mlp[:, k]
+        mu, sig = float(np.mean(wvals)), float(np.std(wvals))
+
+        ax.plot(times_s, wvals, "-", color="mediumpurple", lw=2.0, label="MLP predicted")
+        ax.axhline(w_def_val, color="tomato",    ls="--", lw=1.8, label=f"Default = {w_def_val:.2f}")
+        ax.axhline(mu,        color="steelblue", ls=":",  lw=1.5, label=f"MLP mean = {mu:.2f}")
+        ax.fill_between(times_s, mu - sig, mu + sig, alpha=0.12, color="mediumpurple")
+        ax.set_title(wname.replace("\n", " "), fontsize=12, fontweight="bold")
+        ax.set_xlabel("t [s]", fontsize=10)
+        ax.set_ylabel("Weight value", fontsize=10)
+        ax.legend(fontsize=9, loc="best")
+        ax.grid(True, ls=":", lw=0.5)
+        ax.text(
+            0.97, 0.04,
+            f"μ={mu:.3f}  σ={sig:.3f}\nmin={wvals.min():.3f}  max={wvals.max():.3f}",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=8, color="gray",
+            bbox=dict(fc="white", ec="lightgray", alpha=0.7, pad=2),
+        )
+
+    # 6번째 패널: MLP 평균 vs Default 그룹 바
+    ax_sum = axes[1, 2]
+    short_names = ["long_pos", "lat_pos*", "heading", "steer_r", "accel_r"]
+    mlp_means = [float(np.mean(w_mlp[:, k])) for k in range(5)]
+    x = np.arange(5)
+    bw = 0.35
+    ax_sum.bar(x - bw / 2, mlp_means,          bw, color="mediumpurple",
+               alpha=0.85, edgecolor="white", label="MLP mean")
+    ax_sum.bar(x + bw / 2, list(WEIGHTS_DEFAULT), bw, color="tomato",
+               alpha=0.75, edgecolor="white", label="Default")
+    ax_sum.set_xticks(x)
+    ax_sum.set_xticklabels(short_names, fontsize=9, rotation=15)
+    ax_sum.set_ylabel("Weight value", fontsize=10)
+    ax_sum.set_title("MLP mean vs Default (all weights)", fontsize=12, fontweight="bold")
+    ax_sum.legend(fontsize=9)
+    ax_sum.grid(True, axis="y", ls=":", lw=0.5)
+    ax_sum.text(0.5, -0.20, "* lat_pos is fixed = 1.0 (not predicted)",
+                transform=ax_sum.transAxes, ha="center", fontsize=8, color="gray")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
+    out_path = out_dir / f"{clip_id[:16]}_fig2_weights.png"
+    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+# ══════════════════════════════════════════════════════════════
+# Fig 3 — 제어 입력 분석 (명령값 + 안정성 지표)
+# ══════════════════════════════════════════════════════════════
+
+def plot_fig3_control(
+    clip_id:    str,
+    times_s:    np.ndarray,
+    result:     dict,
+    out_dir:    Path,
+    v0_arr:     np.ndarray | None = None,
+    valid_mask: np.ndarray | None = None,
+) -> Path:
+    """Fig 3: 제어 명령 + Steering Rate / Jerk / 누적 에너지."""
+    u_mlp  = result["u_mlp_hist"]
+    u_def  = result["u_def_hist"]
+    vx_mlp = result["vx_mlp_hist"]
+    vx_def = result["vx_def_hist"]
+
+    sl = _valid_slice(valid_mask, len(times_s))
+    t  = times_s[sl]
+    um = u_mlp[sl]
+    ud = u_def[sl]
+
+    steer_rate_mlp = np.diff(um[:, 0], prepend=um[0, 0])
+    steer_rate_def = np.diff(ud[:, 0], prepend=ud[0, 0])
+    jerk_mlp       = np.diff(um[:, 1], prepend=um[0, 1])
+    jerk_def       = np.diff(ud[:, 1], prepend=ud[0, 1])
+    effort_mlp     = np.cumsum(um[:, 0] ** 2 + um[:, 1] ** 2)
+    effort_def     = np.cumsum(ud[:, 0] ** 2 + ud[:, 1] ** 2)
+
+    sr_rms_mlp = float(np.sqrt(np.mean(steer_rate_mlp[1:] ** 2)))
+    sr_rms_def = float(np.sqrt(np.mean(steer_rate_def[1:] ** 2)))
+    jk_rms_mlp = float(np.sqrt(np.mean(jerk_mlp[1:] ** 2)))
+    jk_rms_def = float(np.sqrt(np.mean(jerk_def[1:] ** 2)))
+
+    fig, axes = plt.subplots(2, 3, figsize=(22, 12))
+    fig.suptitle(
+        f"[Fig 3] Control Input Analysis  |  {clip_id}\n"
+        f"Steering Rate RMS  MLP={sr_rms_mlp:.4f}  Def={sr_rms_def:.4f}  |  "
+        f"Jerk RMS  MLP={jk_rms_mlp:.4f}  Def={jk_rms_def:.4f}",
+        fontsize=12,
+    )
+
+    # [0,0] 조향 명령
+    ax = axes[0, 0]
+    ax.plot(t, um[:, 0], "-",  color="mediumpurple", lw=2.0, label="MLP")
+    ax.plot(t, ud[:, 0], "--", color="tomato",       lw=1.8, label="Default")
+    ax.axhline(0, c="k", lw=0.5)
+    ax.set_xlabel("t [s]", fontsize=10); ax.set_ylabel("[rad]", fontsize=10)
+    ax.set_title("Steering Command", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=10); ax.grid(True, ls=":", lw=0.5)
+
+    # [0,1] 가속 명령
+    ax = axes[0, 1]
+    ax.plot(t, um[:, 1], "-",  color="mediumpurple", lw=2.0, label="MLP")
+    ax.plot(t, ud[:, 1], "--", color="tomato",       lw=1.8, label="Default")
+    ax.axhline(0, c="k", lw=0.5)
+    ax.set_xlabel("t [s]", fontsize=10); ax.set_ylabel("[m/s²]", fontsize=10)
+    ax.set_title("Acceleration Command", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=10); ax.grid(True, ls=":", lw=0.5)
+
+    # [0,2] 속도
+    ax = axes[0, 2]
+    if v0_arr is not None:
+        ax.plot(t, v0_arr[sl], "-", color="gray", lw=1.8,
+                alpha=0.7, label="GT v0", zorder=3)
+    ax.plot(t, vx_mlp[sl], "-",  color="mediumpurple", lw=2.0, label="MLP")
+    ax.plot(t, vx_def[sl], "--", color="tomato",       lw=1.8, label="Default")
+    ax.set_xlabel("t [s]", fontsize=10); ax.set_ylabel("[m/s]", fontsize=10)
+    ax.set_title("Vehicle Speed", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=10); ax.grid(True, ls=":", lw=0.5)
+
+    # [1,0] 조향 Rate — Jitter 지표
+    ax = axes[1, 0]
+    ax.plot(t, steer_rate_mlp, "-",  color="mediumpurple", lw=1.8,
+            label=f"MLP  RMS={sr_rms_mlp:.4f}")
+    ax.plot(t, steer_rate_def, "--", color="tomato",       lw=1.6,
+            label=f"Def  RMS={sr_rms_def:.4f}")
+    ax.axhline(0, c="k", lw=0.5)
+    ax.set_xlabel("t [s]", fontsize=10); ax.set_ylabel("[rad/step]", fontsize=10)
+    ax.set_title("Steering Rate  (jitter indicator, lower = smoother)", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=10); ax.grid(True, ls=":", lw=0.5)
+
+    # [1,1] Jerk — 승차감 지표
+    ax = axes[1, 1]
+    ax.plot(t, jerk_mlp, "-",  color="mediumpurple", lw=1.8,
+            label=f"MLP  RMS={jk_rms_mlp:.4f}")
+    ax.plot(t, jerk_def, "--", color="tomato",       lw=1.6,
+            label=f"Def  RMS={jk_rms_def:.4f}")
+    ax.axhline(0, c="k", lw=0.5)
+    ax.set_xlabel("t [s]", fontsize=10); ax.set_ylabel("[(m/s²)/step]", fontsize=10)
+    ax.set_title("Jerk  (ride comfort indicator, lower = smoother)", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=10); ax.grid(True, ls=":", lw=0.5)
+
+    # [1,2] 누적 제어 에너지
+    ax = axes[1, 2]
+    ax.plot(t, effort_mlp, "-",  color="mediumpurple", lw=2.0,
+            label=f"MLP  total={effort_mlp[-1]:.2f}")
+    ax.plot(t, effort_def, "--", color="tomato",       lw=1.8,
+            label=f"Def  total={effort_def[-1]:.2f}")
+    ax.set_xlabel("t [s]", fontsize=10); ax.set_ylabel("Cumulative Σu²", fontsize=10)
+    ax.set_title("Cumulative Control Effort  (lower = efficient)", fontsize=12, fontweight="bold")
+    ax.legend(fontsize=10); ax.grid(True, ls=":", lw=0.5)
+
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    out_path = out_dir / f"{clip_id[:16]}_fig3_control.png"
+    fig.savefig(out_path, dpi=130, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+# ══════════════════════════════════════════════════════════════
+# Fig 4 — 전방 카메라 스트립 (옵션)
+# ══════════════════════════════════════════════════════════════
+
+def plot_fig4_camera(
+    clip_id:      str,
+    times_s:      np.ndarray,
+    front_frames: np.ndarray,
+    out_dir:      Path,
+) -> Path:
+    """Fig 4: 전방 카메라 타임라인 스트립."""
+    N_CAM   = min(12, len(front_frames))
+    indices = np.linspace(0, len(front_frames) - 1, N_CAM, dtype=int)
+    cmap_t  = plt.cm.plasma(np.linspace(0.1, 0.95, N_CAM))
+
+    fig, axes = plt.subplots(1, N_CAM, figsize=(N_CAM * 2.6, 3.8))
+    fig.suptitle(f"[Fig 4] Front Camera  |  {clip_id}", fontsize=12)
+    if N_CAM == 1:
+        axes = [axes]
+    for ax, idx, color in zip(axes, indices, cmap_t):
+        ax.imshow(front_frames[idx])
+        for spine in ax.spines.values():
+            spine.set_edgecolor(color[:3])
+            spine.set_linewidth(3)
+        ax.set_title(f"t={times_s[idx]:.1f}s", fontsize=9, pad=3)
+        ax.axis("off")
+
+    fig.tight_layout()
+    out_path = out_dir / f"{clip_id[:16]}_fig4_camera.png"
+    fig.savefig(out_path, dpi=110, bbox_inches="tight")
     plt.close(fig)
     return out_path
 
@@ -494,35 +640,24 @@ def _divergence_report(errors: np.ndarray, name: str,
 
 
 # ══════════════════════════════════════════════════════════════
-# main
+# 클립 단위 처리
 # ══════════════════════════════════════════════════════════════
 
-def main():
-    p = argparse.ArgumentParser(
-        description="PCL 시뮬레이션 — build_pcl_dataset.py 출력 h5 파일 사용",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
-    )
-    p.add_argument("--pcl-clip",  required=True,
-                   help="PCL 데이터셋 h5 파일 경로")
-    p.add_argument("--model-dir", required=True,
-                   help="학습된 MLP 모델 디렉토리 (model_full.pt 또는 best_model.pt)")
-    p.add_argument("--out",       required=True,
-                   help="출력 디렉토리 (PNG + npz 저장)")
-    p.add_argument("--device",    default="cpu",
-                   help="추론 장치 (cpu / cuda, default: cpu)")
-    p.add_argument("--no-frames", action="store_true",
-                   help="전방 카메라 패널 제외 (메모리 절약)")
-    args = p.parse_args()
+def _run_one_clip(
+    pcl_path:  Path,
+    model:     "CotendMLP",
+    device:    "torch.device",
+    out_dir:   Path,
+    no_frames: bool,
+    ema_alpha: float = 1.0,
+) -> dict:
+    """
+    h5 파일 한 개를 로드 → 시뮬 → PNG/npz 저장.
 
-    out_dir = Path(args.out)
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    device = torch.device(args.device)
-    model, _ = load_mlp(Path(args.model_dir), device)
-
-    # ── h5 로드 ───────────────────────────────────────────────
-    pcl_path = Path(args.pcl_clip)
+    Returns:
+        dict with keys: clip_id, ade_mlp, ade_def, gain,
+                        fde_mlp, fde_def, status_mlp, status_def
+    """
     print(f"\n{'='*60}")
     print(f"PCL 클립 로드: {pcl_path.name}")
 
@@ -540,7 +675,7 @@ def main():
         gt_yaw_local     = f["gt_yaw_local"][:]
         global_origin_xy = f["global_origin_xy"][:]
         global_yaw       = f["global_yaw"][:]
-        front_frames     = None if args.no_frames else f["front_frames"][:]
+        front_frames     = None if no_frames else f["front_frames"][:]
 
     print(f"  clip_id         : {clip_id}")
     print(f"  n_frames        : {n_frames}  ({t_end - t_start:.1f}s @ {step_us // 1000}ms)")
@@ -549,7 +684,8 @@ def main():
     print(f"  global_origin_xy: {global_origin_xy.shape}")
 
     # ── 시뮬레이션 ────────────────────────────────────────────
-    print(f"\nPCL 시뮬레이션 실행 중  ({n_frames} steps) ...")
+    ema_str = f"EMA α={ema_alpha:.2f}" if ema_alpha < 1.0 else "EMA off"
+    print(f"\nPCL 시뮬레이션 실행 중  ({n_frames} steps, {ema_str}) ...")
     result = run_pcl_simulation(
         cotend=cotend,
         gt_xyz_local=gt_xyz_local,
@@ -559,6 +695,7 @@ def main():
         global_yaw=global_yaw,
         model=model,
         device=device,
+        ema_alpha=ema_alpha,
     )
     print("완료.")
 
@@ -567,6 +704,8 @@ def main():
     err_def = result["errors_def"]
     ade_mlp = float(np.mean(err_mlp[1:]))
     ade_def = float(np.mean(err_def[1:]))
+    fde_mlp = float(err_mlp[-1])
+    fde_def = float(err_def[-1])
     gain    = (ade_def - ade_mlp) / ade_def * 100 if ade_def > 0 else 0.0
 
     print(f"\n{'─'*60}")
@@ -580,17 +719,22 @@ def main():
 
     # ── valid_mask 계산 (open-loop 구간 탐지) ────────────────
     valid_mask = compute_valid_mask(gt_xyz_local)
-    n_valid = int(valid_mask.sum())
-    n_invalid = len(valid_mask) - n_valid
+    n_invalid  = int((~valid_mask).sum())
     if n_invalid > 0:
         print(f"  open-loop frames: {n_invalid} (last {n_invalid * step_us // 1000}ms excluded from plot)")
 
-    # ── PNG 저장 ──────────────────────────────────────────────
-    png_path = plot_pcl_result(
-        clip_id, times_s, result, front_frames, out_dir,
-        v0_arr=v0_arr, valid_mask=valid_mask,
-    )
-    print(f"\n시각화 저장: {png_path}")
+    # ── PNG 저장 (4개 분리 figure) ────────────────────────────
+    print("\n시각화 저장 중...")
+    saved = []
+    saved.append(plot_fig1_overview(clip_id, times_s, result, out_dir,
+                                    valid_mask=valid_mask))
+    saved.append(plot_fig2_weights(clip_id, times_s, result, out_dir))
+    saved.append(plot_fig3_control(clip_id, times_s, result, out_dir,
+                                   v0_arr=v0_arr, valid_mask=valid_mask))
+    if front_frames is not None and len(front_frames) > 0:
+        saved.append(plot_fig4_camera(clip_id, times_s, front_frames, out_dir))
+    for sp in saved:
+        print(f"  → {sp.name}")
 
     # ── npz 저장 (추가 분석용) ────────────────────────────────
     npz_path = out_dir / f"{clip_id[:16]}_pcl_sim.npz"
@@ -608,6 +752,109 @@ def main():
     )
     print(f"수치 결과 저장: {npz_path}")
     print(f"{'='*60}\n")
+
+    return dict(
+        clip_id    = clip_id,
+        ade_mlp    = ade_mlp,
+        ade_def    = ade_def,
+        fde_mlp    = fde_mlp,
+        fde_def    = fde_def,
+        gain       = gain,
+        max_e_mlp  = float(np.max(err_mlp[1:])),
+        max_e_def  = float(np.max(err_def[1:])),
+    )
+
+
+# ══════════════════════════════════════════════════════════════
+# main
+# ══════════════════════════════════════════════════════════════
+
+def main():
+    p = argparse.ArgumentParser(
+        description="PCL 시뮬레이션 — build_pcl_dataset.py 출력 h5 파일 사용",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--pcl-clip", metavar="H5",
+                     help="PCL h5 파일 경로 (단일 클립)")
+    src.add_argument("--pcl-dir",  metavar="DIR",
+                     help="PCL h5 파일이 들어있는 디렉토리 (전체 일괄 실행)")
+
+    p.add_argument("--model-dir", required=True,
+                   help="학습된 MLP 모델 디렉토리 (model_full.pt 또는 best_model.pt)")
+    p.add_argument("--out",       required=True,
+                   help="출력 디렉토리 (PNG + npz 저장)")
+    p.add_argument("--device",    default="cuda",
+                   help="추론 장치 (cpu / cuda, default: cuda)")
+    p.add_argument("--no-frames", action="store_true",
+                   help="전방 카메라 패널 제외 (메모리 절약)")
+    p.add_argument("--ema-alpha", type=float, default=1.0, metavar="ALPHA",
+                   help="MLP 가중치 EMA 평활화 계수 0<α≤1 (1.0=비활성, 권장 0.3~0.5, default: 1.0)")
+    args = p.parse_args()
+
+    if not (0.0 < args.ema_alpha <= 1.0):
+        p.error("--ema-alpha 는 (0, 1] 범위여야 합니다.")
+
+    out_dir = Path(args.out)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    device = torch.device(args.device)
+    model, _ = load_mlp(Path(args.model_dir), device)
+
+    # ── 처리할 h5 파일 목록 결정 ─────────────────────────────
+    if args.pcl_clip:
+        h5_files = [Path(args.pcl_clip)]
+    else:
+        h5_files = sorted(Path(args.pcl_dir).glob("*.h5"))
+        if not h5_files:
+            print(f"[ERROR] {args.pcl_dir} 에서 .h5 파일을 찾을 수 없습니다.")
+            return
+        print(f"총 {len(h5_files)}개 클립 발견: {args.pcl_dir}")
+
+    # ── 클립별 순차 실행 ─────────────────────────────────────
+    summaries = []
+    errors_list = []
+    for idx, h5_path in enumerate(h5_files, 1):
+        print(f"\n[{idx}/{len(h5_files)}] {h5_path.name}")
+        try:
+            stats = _run_one_clip(h5_path, model, device, out_dir, args.no_frames,
+                                  ema_alpha=args.ema_alpha)
+            summaries.append(stats)
+        except Exception as exc:
+            print(f"  [SKIP] 처리 실패: {exc}")
+            errors_list.append((h5_path.name, str(exc)))
+
+    # ── 전체 요약 (다중 클립 시에만 출력) ────────────────────
+    if len(summaries) > 1:
+        print(f"\n{'#'*70}")
+        print(f"  BATCH SUMMARY  ({len(summaries)} clips processed, {len(errors_list)} failed)")
+        print(f"{'#'*70}")
+        print(f"  {'Clip':38s}  {'ADE_MLP':>8}  {'ADE_Def':>8}  {'Gain':>7}  {'MaxE_MLP':>9}")
+        print(f"  {'-'*38}  {'-'*8}  {'-'*8}  {'-'*7}  {'-'*9}")
+        ade_mlp_all = []
+        ade_def_all = []
+        for s in summaries:
+            print(
+                f"  {s['clip_id'][:38]:38s}  "
+                f"{s['ade_mlp']:8.4f}  "
+                f"{s['ade_def']:8.4f}  "
+                f"{s['gain']:+7.2f}%  "
+                f"{s['max_e_mlp']:9.4f}"
+            )
+            ade_mlp_all.append(s["ade_mlp"])
+            ade_def_all.append(s["ade_def"])
+        mean_mlp  = float(np.mean(ade_mlp_all))
+        mean_def  = float(np.mean(ade_def_all))
+        mean_gain = (mean_def - mean_mlp) / mean_def * 100 if mean_def > 0 else 0.0
+        print(f"  {'-'*38}  {'-'*8}  {'-'*8}  {'-'*7}  {'-'*9}")
+        print(f"  {'MEAN':38s}  {mean_mlp:8.4f}  {mean_def:8.4f}  {mean_gain:+7.2f}%")
+        if errors_list:
+            print(f"\n  Failed clips:")
+            for name, err in errors_list:
+                print(f"    {name}: {err}")
+        print(f"{'#'*70}\n")
 
 
 if __name__ == "__main__":

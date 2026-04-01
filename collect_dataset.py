@@ -151,9 +151,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-dir",
-        default="/workspace/alpamayo_dataset/data/alpamayo_weights",
+        default="/workspace/alpamayo_dataset/data/alpamayo_1.5_weights",
         metavar="DIR",
-        help="로컬 모델 가중치 디렉토리 (기본: /workspace/alpamayo_dataset/data/alpamayo_weights)",
+        help="로컬 모델 가중치 디렉토리 (기본: /workspace/alpamayo_dataset/data/alpamayo_1.5_weights)",
     )
     parser.add_argument(
         "--dataset-dir",
@@ -274,10 +274,10 @@ def main() -> None:
     torch.cuda.manual_seed_all(args.seed)
 
     # 로컬 가중치에서 모델 로드
-    log.info("AlpamayoR1 모델 로딩: %s", args.model_dir)
-    from alpamayo_r1.models.alpamayo_r1 import AlpamayoR1
+    log.info("Alpamayo1_5 모델 로딩: %s", args.model_dir)
+    from alpamayo1_5.models.alpamayo1_5 import Alpamayo1_5
 
-    model = AlpamayoR1.from_pretrained(args.model_dir, dtype=torch.bfloat16).to("cuda")
+    model = Alpamayo1_5.from_pretrained(args.model_dir, dtype=torch.bfloat16).to("cuda")
     model.eval()
 
     # 로컬 데이터셋 디렉토리로 AVDI 초기화 (HF 인증 없이 로컬 파일 직접 사용)
@@ -330,7 +330,7 @@ def main() -> None:
     )
     avdi.download_metadata()
 
-    from alpamayo_r1.dataset.collector import AlpamayoDatasetCollector
+    from dataset.collector import AlpamayoDatasetCollector
 
     # viz_dir: --no-viz이면 False(비활성화), --viz-dir 지정 시 해당 경로, 기본은 output_dir
     viz_dir = False if args.no_viz else (args.viz_dir or args.output_dir)

@@ -136,6 +136,13 @@ def _set_traj_limits(ax, *xy_arrays):
     ax.set_ylim(cy - half, cy + half)
 
 
+def _comfort_metrics(U: np.ndarray) -> tuple[float, float]:
+    """U (N, 2) → (steer_rate_rms [rad/step], jerk_rms [(m/s²)/step])."""
+    sr_rms   = float(np.sqrt(np.mean(np.diff(U[:, 0]) ** 2)))
+    jerk_rms = float(np.sqrt(np.mean(np.diff(U[:, 1]) ** 2)))
+    return sr_rms, jerk_rms
+
+
 # ══════════════════════════════════════════════════════
 # 경량 셀 플롯 (--all 격자용)
 #   GT + Opt 궤적만 그림. Default MPC 계산 생략 → 2× 빠름.
@@ -153,6 +160,8 @@ def plot_cell(ax, h5_path: Path):
         w_opt      = f["labels/mpc_weights"][:]
         ade_stored = float(f["labels/ade"][()])
         valid      = bool(f["labels/valid"][()])
+        sr_stored  = float(f["labels/steer_rate_rms"][()]) if "labels/steer_rate_rms" in f else None
+        jr_stored  = float(f["labels/jerk_rms"][()])       if "labels/jerk_rms"       in f else None
 
     v0       = float(hist[-1, 2])
     gt_yaw   = gt_ego[:, 3]
@@ -161,18 +170,21 @@ def plot_cell(ax, h5_path: Path):
     xy_opt, _, _ = run_mpc(v0, gt_xyz, gt_yaw, w_opt)
 
     ax.plot(gt_xy[:, 1],  gt_xy[:, 0],  "g-",  lw=1.5, label="GT")
-    ax.plot(xy_opt[:, 1], xy_opt[:, 0], "b--", lw=1.2, label=f"Opt")
+    ax.plot(xy_opt[:, 1], xy_opt[:, 0], "b--", lw=1.2, label="Opt")
     ax.scatter([0], [0], c="k", s=20, zorder=5)
 
     _set_traj_limits(ax, gt_xy, xy_opt)
     ax.grid(True, ls=":", lw=0.4)
 
-    valid_mark = "✓" if valid else "✗"
-    short_name = name[:22] + "…" if len(name) > 22 else name
+    valid_mark   = "✓" if valid else "✗"
+    short_name   = name[:22] + "…" if len(name) > 22 else name
+    comfort_line = (f"\nSR={sr_stored:.4f} J={jr_stored:.4f}"
+                    if sr_stored is not None else "")
     ax.set_title(
         f"{short_name}\n"
         f"v0={v0:.1f} ADE={ade_stored:.3f}m {valid_mark}\n"
-        f"w=[{w_opt[0]:.1f},{w_opt[2]:.2f},{w_opt[3]:.3f},{w_opt[4]:.2f}]",
+        f"w=[{w_opt[0]:.1f},{w_opt[2]:.2f},{w_opt[3]:.3f},{w_opt[4]:.2f}]"
+        f"{comfort_line}",
         fontsize=5.5,
     )
     ax.tick_params(labelsize=5)
@@ -204,6 +216,9 @@ def plot_sample(ax_traj, ax_ctrl, h5_path):
     xy_opt, U_opt, ade_opt = run_mpc(v0, gt_xyz, gt_yaw, w_opt)
     xy_def, U_def, ade_def = run_mpc(v0, gt_xyz, gt_yaw, WEIGHTS_DEFAULT)
 
+    sr_opt, jr_opt = _comfort_metrics(U_opt)
+    sr_def, jr_def = _comfort_metrics(U_def)
+
     ax_traj.plot(gt_xy[:, 1],  gt_xy[:, 0],  "g-",  lw=2.0, label="GT")
     ax_traj.plot(xy_opt[:, 1], xy_opt[:, 0], "b--", lw=1.5, label=f"Opt ADE={ade_opt:.3f}m")
     ax_traj.plot(xy_def[:, 1], xy_def[:, 0], "r:",  lw=1.2, label=f"Default ADE={ade_def:.3f}m")
@@ -226,6 +241,11 @@ def plot_sample(ax_traj, ax_ctrl, h5_path):
     ax_ctrl.axhline(0, c="k", lw=0.5, ls="--")
     ax_ctrl.set_xlabel("Time [s]", fontsize=7)
     ax_ctrl.set_ylabel("Cmd",      fontsize=7)
+    ax_ctrl.set_title(
+        f"Control  |  opt: SR={sr_opt:.4f}  Jerk={jr_opt:.4f}"
+        f"   def: SR={sr_def:.4f}  Jerk={jr_def:.4f}",
+        fontsize=6,
+    )
     ax_ctrl.legend(fontsize=6, ncol=2)
     ax_ctrl.grid(True, ls=":", lw=0.5)
 
@@ -238,99 +258,145 @@ def plot_single(h5_path: Path, out_dir: Path):
     name = h5_path.stem
 
     with h5py.File(h5_path, "r") as f:
-        gt_xyz   = f["gt/future_xyz"][:]
-        gt_ego   = f["gt/future_ego_states"][:]
-        hist     = f["input/ego_history_ego_states"][:]
+        gt_xyz     = f["gt/future_xyz"][:]
+        gt_ego     = f["gt/future_ego_states"][:]
+        hist       = f["input/ego_history_ego_states"][:]
         if "labels/mpc_weights" not in f:
-            print(f"[WARN] {h5_path.name} 에 labels/mpc_weights 없음")
+            print(f"[WARN] {h5_path.name} has no labels/mpc_weights")
             return
-        w_opt = f["labels/mpc_weights"][:]
+        w_opt      = f["labels/mpc_weights"][:]
         ade_stored = float(f["labels/ade"][()])
 
-    v0       = float(hist[-1, 2])
-    gt_yaw   = gt_ego[:, 3]
-    gt_xy    = gt_xyz[:N, :2]
-    t_axis   = np.arange(1, N+1) * DT
+    v0     = float(hist[-1, 2])
+    gt_yaw = gt_ego[:, 3]
+    gt_xy  = gt_xyz[:N, :2]
+    t_axis = np.arange(1, N + 1) * DT
+    t_diff = t_axis[:-1]          # N-1 midpoints for diff-based plots
 
     xy_opt, U_opt, ade_opt = run_mpc(v0, gt_xyz, gt_yaw, w_opt)
     xy_def, U_def, ade_def = run_mpc(v0, gt_xyz, gt_yaw, WEIGHTS_DEFAULT)
 
-    fig = plt.figure(figsize=(15, 8))
-    fig.suptitle(
-        f"{h5_path.name}\nv0={v0:.1f} m/s | Opt ADE={ade_opt:.3f}m (stored={ade_stored:.3f}m)"
-        f" | Default ADE={ade_def:.3f}m",
-        fontsize=10
-    )
-    # 3행 3열: 좌열=궤적(3행), 중열=오차+steer+accel, 우열=가중치(3행)
-    gs = gridspec.GridSpec(3, 3, figure=fig, hspace=0.55, wspace=0.35)
+    sr_opt, jr_opt = _comfort_metrics(U_opt)
+    sr_def, jr_def = _comfort_metrics(U_def)
 
-    # ── (좌) 궤적 ──
+    fig = plt.figure(figsize=(15, 11))
+    fig.suptitle(
+        f"{h5_path.name}   v0={v0:.1f} m/s   stored ADE={ade_stored:.3f}m\n"
+        f"Opt  ADE={ade_opt:.3f}m  SR={sr_opt:.4f}  Jerk={jr_opt:.4f}   |   "
+        f"Def  ADE={ade_def:.3f}m  SR={sr_def:.4f}  Jerk={jr_def:.4f}",
+        fontsize=9,
+    )
+
+    # Layout: 4 rows × 3 cols
+    #   col 0 (all rows) : trajectory
+    #   row 0, col 1-2   : ADE per-step error  (wide)
+    #   row 1, col 1     : steer command
+    #   row 1, col 2     : accel command
+    #   row 2, col 1     : steer rate  |Δsteer|
+    #   row 2, col 2     : jerk        |Δaccel|
+    #   row 3, col 1-2   : MPC weight bar chart (wide)
+    gs = gridspec.GridSpec(4, 3, figure=fig, hspace=0.60, wspace=0.35)
+
+    # ── trajectory (col 0) ──────────────────────────────
     ax_traj = fig.add_subplot(gs[:, 0])
-    ax_traj.plot(gt_xy[:, 1],  gt_xy[:, 0],  "g-",  lw=2.5,  label="GT")
-    ax_traj.plot(xy_opt[:, 1], xy_opt[:, 0], "b--", lw=2.0,  label=f"Opt   ADE={ade_opt:.3f}m")
-    ax_traj.plot(xy_def[:, 1], xy_def[:, 0], "r:",  lw=1.8,  label=f"Def   ADE={ade_def:.3f}m")
-    ax_traj.scatter([0],[0], c="k", s=50, zorder=5, label="t0")
+    ax_traj.plot(gt_xy[:, 1],  gt_xy[:, 0],  "g-",  lw=2.5, label="GT")
+    ax_traj.plot(xy_opt[:, 1], xy_opt[:, 0], "b--", lw=2.0, label=f"Opt  ADE={ade_opt:.3f}m")
+    ax_traj.plot(xy_def[:, 1], xy_def[:, 0], "r:",  lw=1.8, label=f"Def  ADE={ade_def:.3f}m")
+    ax_traj.scatter([0], [0], c="k", s=50, zorder=5, label="t0")
     for k in [4, 9, 14, 19]:
         ax_traj.annotate(f"{(k+1)*DT:.1f}s",
-                         xy=(gt_xy[k,1], gt_xy[k,0]), fontsize=6, color="green",
+                         xy=(gt_xy[k, 1], gt_xy[k, 0]), fontsize=6, color="green",
                          xytext=(3, 3), textcoords="offset points")
-
-    # 축 범위를 수동으로 계산해 equal-aspect + 여백 보장
-    all_lat = np.concatenate([gt_xy[:,1], xy_opt[:,1], xy_def[:,1], [0.]])
-    all_lon = np.concatenate([gt_xy[:,0], xy_opt[:,0], xy_def[:,0], [0.]])
-    half = max(all_lat.max()-all_lat.min(), all_lon.max()-all_lon.min()) / 2 + 1.5
+    all_lat = np.concatenate([gt_xy[:, 1], xy_opt[:, 1], xy_def[:, 1], [0.]])
+    all_lon = np.concatenate([gt_xy[:, 0], xy_opt[:, 0], xy_def[:, 0], [0.]])
+    half = max(all_lat.max() - all_lat.min(), all_lon.max() - all_lon.min()) / 2 + 1.5
     cx = (all_lat.max() + all_lat.min()) / 2
     cy = (all_lon.max() + all_lon.min()) / 2
-    ax_traj.set_xlim(cx + half, cx - half)   # x축 반전 (운전자 시점: 좌=+Y)
+    ax_traj.set_xlim(cx + half, cx - half)
     ax_traj.set_ylim(cy - half, cy + half)
-
-    ax_traj.set_xlabel("Y / lateral [m]"); ax_traj.set_ylabel("X / longitudinal [m]")
+    ax_traj.set_xlabel("Y / lateral [m]")
+    ax_traj.set_ylabel("X / longitudinal [m]")
     ax_traj.set_title("Trajectory (vehicle frame)\n(← left turn | right turn →)")
-    ax_traj.legend(loc="best", fontsize=8); ax_traj.grid(True, ls=":", lw=0.5)
+    ax_traj.legend(loc="best", fontsize=8)
+    ax_traj.grid(True, ls=":", lw=0.5)
 
-    # ── (중상) 스텝별 거리 오차 ──
-    # 각 타임스텝 k에서: ||pred_xy_k - gt_xy_k|| [m]
-    # ADE = 이 값들의 평균 (Average Displacement Error)
-    ax_err = fig.add_subplot(gs[0, 1])
+    # ── ADE per-step error (row 0, cols 1-2) ────────────
+    ax_err = fig.add_subplot(gs[0, 1:3])
     err_opt = np.linalg.norm(xy_opt - gt_xy, axis=1)
     err_def = np.linalg.norm(xy_def - gt_xy, axis=1)
     ax_err.plot(t_axis, err_opt, "b--", lw=1.8, label=f"Opt  ADE={err_opt.mean():.3f}m")
     ax_err.plot(t_axis, err_def, "r:",  lw=1.5, label=f"Def  ADE={err_def.mean():.3f}m")
-    ax_err.set_xlabel("Time [s]"); ax_err.set_ylabel("||pred - GT|| [m]")
-    ax_err.set_title("Per-step displacement error\n(ADE = mean of this curve)")
-    ax_err.legend(fontsize=8); ax_err.grid(True, ls=":", lw=0.5)
+    ax_err.set_xlabel("Time [s]")
+    ax_err.set_ylabel("||pred - GT|| [m]")
+    ax_err.set_title("Per-step displacement error  (ADE = mean)")
+    ax_err.legend(fontsize=8)
+    ax_err.grid(True, ls=":", lw=0.5)
     ax_err.set_ylim(bottom=0)
 
-    # ── (중중) Steering 제어 입력 ──
+    # ── Steer command (row 1, col 1) ────────────────────
     ax_steer = fig.add_subplot(gs[1, 1])
-    ax_steer.plot(t_axis, U_opt[:,0], "b--", lw=1.8, label="steer_cmd (opt)")
-    ax_steer.plot(t_axis, U_def[:,0], "r:",  lw=1.5, label="steer_cmd (def)")
+    ax_steer.plot(t_axis, U_opt[:, 0], "b--", lw=1.8, label="opt")
+    ax_steer.plot(t_axis, U_def[:, 0], "r:",  lw=1.5, label="def")
     ax_steer.axhline(0, c="k", lw=0.5, ls="--")
-    ax_steer.set_xlabel("Time [s]"); ax_steer.set_ylabel("Steering [rad]")
+    ax_steer.set_xlabel("Time [s]")
+    ax_steer.set_ylabel("Steering [rad]")
     ax_steer.set_title("Steering command")
-    ax_steer.legend(fontsize=7); ax_steer.grid(True, ls=":", lw=0.5)
+    ax_steer.legend(fontsize=7)
+    ax_steer.grid(True, ls=":", lw=0.5)
 
-    # ── (중하) Acceleration 제어 입력 ──
-    ax_accel = fig.add_subplot(gs[2, 1])
-    ax_accel.plot(t_axis, U_opt[:,1], "b--", lw=1.8, label="accel_cmd (opt)")
-    ax_accel.plot(t_axis, U_def[:,1], "r:",  lw=1.5, label="accel_cmd (def)")
+    # ── Accel command (row 1, col 2) ────────────────────
+    ax_accel = fig.add_subplot(gs[1, 2])
+    ax_accel.plot(t_axis, U_opt[:, 1], "b--", lw=1.8, label="opt")
+    ax_accel.plot(t_axis, U_def[:, 1], "r:",  lw=1.5, label="def")
     ax_accel.axhline(0, c="k", lw=0.5, ls="--")
-    ax_accel.set_xlabel("Time [s]"); ax_accel.set_ylabel("Accel [m/s²]")
+    ax_accel.set_xlabel("Time [s]")
+    ax_accel.set_ylabel("Accel [m/s²]")
     ax_accel.set_title("Acceleration command")
-    ax_accel.legend(fontsize=7); ax_accel.grid(True, ls=":", lw=0.5)
+    ax_accel.legend(fontsize=7)
+    ax_accel.grid(True, ls=":", lw=0.5)
 
-    # ── (우) 가중치 막대 비교 ──
-    ax_w = fig.add_subplot(gs[:, 2])
-    labels_w = ["long\npos", "lat\npos\n(fixed)", "heading", "steer\nrate", "accel\nrate"]
-    x = np.arange(len(labels_w)); width=0.35
-    ax_w.bar(x - width/2, w_opt,           width, label="Optimal", color="steelblue", alpha=0.8)
-    ax_w.bar(x + width/2, WEIGHTS_DEFAULT, width, label="Default",  color="tomato",    alpha=0.6)
-    ax_w.set_xticks(x); ax_w.set_xticklabels(labels_w, fontsize=8)
-    ax_w.set_ylabel("Weight value"); ax_w.set_title("MPC cost weights")
-    ax_w.legend(); ax_w.grid(True, axis="y", ls=":", lw=0.5)
-    for i,(ov,dv) in enumerate(zip(w_opt, WEIGHTS_DEFAULT)):
-        ax_w.text(i-width/2, ov+0.05, f"{ov:.2f}", ha="center", fontsize=7, color="steelblue")
-        ax_w.text(i+width/2, dv+0.05, f"{dv:.2f}", ha="center", fontsize=7, color="tomato")
+    # ── Steer rate |Δsteer| (row 2, col 1) ──────────────
+    ax_sr = fig.add_subplot(gs[2, 1])
+    ax_sr.plot(t_diff, np.abs(np.diff(U_opt[:, 0])), "b--", lw=1.8,
+               label=f"opt  rms={sr_opt:.4f}")
+    ax_sr.plot(t_diff, np.abs(np.diff(U_def[:, 0])), "r:",  lw=1.5,
+               label=f"def  rms={sr_def:.4f}")
+    ax_sr.set_xlabel("Time [s]")
+    ax_sr.set_ylabel("|Δsteer| [rad/step]")
+    ax_sr.set_title("Steering rate  |Δsteer|")
+    ax_sr.legend(fontsize=7)
+    ax_sr.grid(True, ls=":", lw=0.5)
+    ax_sr.set_ylim(bottom=0)
+
+    # ── Jerk |Δaccel| (row 2, col 2) ────────────────────
+    ax_jerk = fig.add_subplot(gs[2, 2])
+    ax_jerk.plot(t_diff, np.abs(np.diff(U_opt[:, 1])), "b--", lw=1.8,
+                 label=f"opt  rms={jr_opt:.4f}")
+    ax_jerk.plot(t_diff, np.abs(np.diff(U_def[:, 1])), "r:",  lw=1.5,
+                 label=f"def  rms={jr_def:.4f}")
+    ax_jerk.set_xlabel("Time [s]")
+    ax_jerk.set_ylabel("|Δaccel| [(m/s²)/step]")
+    ax_jerk.set_title("Jerk  |Δaccel|")
+    ax_jerk.legend(fontsize=7)
+    ax_jerk.grid(True, ls=":", lw=0.5)
+    ax_jerk.set_ylim(bottom=0)
+
+    # ── MPC weight bar (row 3, cols 1-2) ────────────────
+    ax_w = fig.add_subplot(gs[3, 1:3])
+    labels_w = ["long pos", "lat pos\n(fixed)", "heading", "steer rate", "accel rate"]
+    x = np.arange(len(labels_w))
+    width = 0.35
+    ax_w.bar(x - width / 2, w_opt,           width, label="Optimal", color="steelblue", alpha=0.8)
+    ax_w.bar(x + width / 2, WEIGHTS_DEFAULT, width, label="Default",  color="tomato",    alpha=0.6)
+    ax_w.set_xticks(x)
+    ax_w.set_xticklabels(labels_w, fontsize=8)
+    ax_w.set_ylabel("Weight value")
+    ax_w.set_title("MPC cost weights")
+    ax_w.legend()
+    ax_w.grid(True, axis="y", ls=":", lw=0.5)
+    for i, (ov, dv) in enumerate(zip(w_opt, WEIGHTS_DEFAULT)):
+        ax_w.text(i - width / 2, ov + 0.05, f"{ov:.2f}", ha="center", fontsize=7, color="steelblue")
+        ax_w.text(i + width / 2, dv + 0.05, f"{dv:.2f}", ha="center", fontsize=7, color="tomato")
 
     out_path = out_dir / f"{name}_mpc_viz.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
