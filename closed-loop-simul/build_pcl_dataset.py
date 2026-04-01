@@ -707,7 +707,9 @@ def _parse_args() -> argparse.Namespace:
         epilog=__doc__,
     )
     p.add_argument(
-        "--manifest", default=None, metavar="JSON",
+        "--manifest", 
+        default="../alpamayo_dataset/data/split/split_manifest.json", 
+        metavar="JSON",
         help="split_manifest.json 경로 (clips_test 키 사용). "
              "생략 시 --dataset-dir/clip_index.parquet의 split==test 클립 전체 사용",
     )
@@ -717,13 +719,13 @@ def _parse_args() -> argparse.Namespace:
     )
     p.add_argument(
         "--model-dir",
-        default="/workspace/alpamayo_dataset/data/alpamayo_1.5_weights",
+        default="../alpamayo_dataset/data/alpamayo_1.5_weights",
         metavar="DIR",
         help="Alpamayo1_5 가중치 디렉토리 (기본: alpamayo_1.5_weights)",
     )
     p.add_argument(
         "--dataset-dir",
-        default="/workspace/alpamayo_dataset/data/nvidia_test_scenario",
+        default="../alpamayo_dataset/data/nvidia_test_scenario",
         metavar="DIR",
         help="nvidia_test_scenario 로컬 데이터셋 디렉토리",
     )
