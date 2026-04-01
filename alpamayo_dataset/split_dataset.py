@@ -2,9 +2,12 @@
 """
 데이터셋 분할 스크립트
 
-labels/valid == True이고 cotend가 존재하는 h5 파일을
+output/cotend_hidden_state가 존재하는 h5 파일을
 클립(UUID) 단위로 70/20/10 Stratified 분할해 train/, val/, test/ 디렉토리에
 심볼릭 링크를 생성합니다. 원본 파일은 이동하지 않습니다.
+
+실행 순서: filter_error_samples.py (STEP 1.5) → split_dataset.py → label_mpc_weights.py (STEP 2)
+라벨링(labels/valid, labels/mpc_weights) 완료 전에 실행 가능.
 
 Stratified 분할:
   lateral 클립과 longitudinal 클립을 각각 비율대로 나눈 뒤 합산.
@@ -46,14 +49,10 @@ import numpy as np
 
 
 def is_valid(path: Path) -> bool:
-    """라벨링 완료 + valid + cotend 존재 여부 확인."""
+    """cotend_hidden_state 존재 여부 확인 (filter_error 이후 실행 기준)."""
     try:
         with h5py.File(path, "r") as f:
-            return (
-                "labels/mpc_weights" in f
-                and "output/cotend_hidden_state" in f
-                and bool(f["labels/valid"][()])
-            )
+            return "output/cotend_hidden_state" in f
     except Exception:
         return False
 
@@ -62,12 +61,7 @@ def _scan_file(path_str: str) -> tuple[bool, float]:
     """ProcessPoolExecutor용 — (is_valid, max_lat) 반환. 실패 시 (False, 0.0)."""
     try:
         with h5py.File(path_str, "r") as f:
-            valid = (
-                "labels/mpc_weights" in f
-                and "output/cotend_hidden_state" in f
-                and bool(f["labels/valid"][()])
-            )
-            if not valid:
+            if "output/cotend_hidden_state" not in f:
                 return False, 0.0
             lat_y = f["gt/future_xyz"][:20, 1]   # GT 20스텝 횡방향 변위 [m]
         return True, float(np.max(np.abs(lat_y)))
@@ -134,7 +128,7 @@ def main():
     print(f"{len(valid_files):,}개")
 
     if not valid_files:
-        print("[ERROR] 유효 샘플이 없습니다. 라벨링을 먼저 실행하세요.")
+        print("[ERROR] 유효 샘플이 없습니다. filter_error_samples.py 실행 후 data/collected/에 h5 파일이 있는지 확인하세요.")
         return
 
     # ── 클립 단위 그룹화 ───────────────────────────────
