@@ -32,7 +32,7 @@ N_OUT       = len(PREDICT_IDX)  # 4
 # log-scale 범위 (label_mpc_weights.py _THETA_MIN/MAX 와 동일)
 #              long   head   steer_r  accel_r
 LOG_MIN = np.array(np.log([0.1,  0.1,  1.0,  0.2 ]), dtype=np.float32)
-LOG_MAX = np.array(np.log([10.,  10.,  50.,  10. ]), dtype=np.float32)
+LOG_MAX = np.array(np.log([10.,  10.,  25.,  10. ]), dtype=np.float32)  # steer_r: label_mpc_weights._THETA_MAX[2]=log(25)와 일치
 
 
 # ══════════════════════════════════════════════════════

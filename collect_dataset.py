@@ -151,7 +151,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model-dir",
-        default="/workspace/alpamayo_dataset/data/alpamayo_1.5_weights",
+        default="/workspace/Alpamayo-MPC/alpamayo_dataset/data/alpamayo_1.5_weights",
         metavar="DIR",
         help="로컬 모델 가중치 디렉토리 (기본: /workspace/alpamayo_dataset/data/alpamayo_1.5_weights)",
     )

@@ -3,8 +3,37 @@ CLAUDE.md
 /.claude
 /alpamayo_dataset/data/
 /alpamayo_dataset/viz_out_tqf/
+viz_out/
+
 
 *.ply
 *.usdz
 *.asl
 Only ADE
+
+/closed-loop-simul/pcl_clips
+
+# Python cache
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+*.egg-info/
+.eggs/
+
+# 가상환경
+.venv/
+venv/
+*.venv/
+ar1_venv/
+
+
+pcl_out*/
+viz_out*/
+
+result/
+alpamayo_dataset/__pycache__/mpc.cpython-314.pyc
+alpamayo_dataset/__pycache__/model.cpython-314.pyc
+alpamayo_dataset/__pycache__/model.cpython-314.pyc
+alpamayo_dataset/__pycache__/mpc.cpython-314.pyc
+alpamayo_dataset/__pycache__/viz_mpc_label.cpython-314.pyc

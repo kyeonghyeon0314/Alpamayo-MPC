@@ -91,7 +91,7 @@ class CotendDataset(Dataset):
     """
 
     def __init__(self, split_dir: Path, name: str = "", workers: int = 8,
-                 rebuild_cache: bool = False):
+                 rebuild_cache: bool = False, data_dir: Path | None = None):
         label      = f"[{name}]" if name else ""
         cache_path = split_dir / "_mlp_cache.npz"
 
@@ -107,9 +107,28 @@ class CotendDataset(Dataset):
         # ── 캐시 미스: h5 파일 순차 로드 후 캐시 저장 ────
         # IPC pickle 비용(~1GB) > 병렬화 이득 → 순차 로드
         h5_files = sorted(split_dir.glob("*.h5"))
+
+        # 심볼릭 링크 없음 → manifest + data_dir 폴백 (Windows symlink 불가 환경)
+        if not h5_files and data_dir is not None:
+            manifest_path = split_dir.parent / "split_manifest.json"
+            split_name    = split_dir.name          # "train" / "val" / "test"
+            if manifest_path.exists():
+                with open(manifest_path) as _f:
+                    _m = json.load(_f)
+                clip_ids = set(_m.get(f"clips_{split_name}", []))
+                if clip_ids:
+                    h5_files = sorted(
+                        p for p in Path(data_dir).glob("*.h5")
+                        if p.stem.split("__")[0] in clip_ids
+                    )
+                    print(f"  {label:<8} manifest 기반 {len(h5_files):,}개 ({data_dir})")
+
         if not h5_files:
-            raise RuntimeError(f"{split_dir} 에 .h5 파일이 없습니다. "
-                               "split_dataset.py를 먼저 실행하세요.")
+            raise RuntimeError(
+                f"{split_dir} 에 .h5 파일이 없습니다.\n"
+                "  심볼릭 링크: split_dataset.py 실행\n"
+                "  또는 --data-dir 로 원본 h5 디렉토리를 지정하세요."
+            )
 
         cotends, thetas, max_lats = [], [], []
         skipped = 0
@@ -236,7 +255,9 @@ def main():
         epilog=__doc__,
     )
     parser.add_argument("--split-dir",    required=True,
-                        help="split_dataset.py 로 생성된 디렉토리 (train/val/test/ 포함)")
+                        help="split_dataset.py 로 생성된 디렉토리 (split_manifest.json 포함)")
+    parser.add_argument("--data-dir",     default=None,
+                        help="원본 .h5 디렉토리. 심볼릭 링크 없을 때 manifest와 함께 사용")
     parser.add_argument("--out",          default="mlp_out",
                         help="출력 디렉토리 (default: mlp_out)")
     parser.add_argument("--epochs",       type=int,   default=300)
@@ -277,9 +298,13 @@ def main():
 
     logger = setup_logger(out_dir)
 
-    for sub in ("train", "val", "test"):
-        if not (split_dir / sub).exists():
-            raise FileNotFoundError(f"{split_dir}/{sub}/ 없음. split_dataset.py를 먼저 실행하세요.")
+    manifest_path = split_dir / "split_manifest.json"
+    if not manifest_path.exists():
+        raise FileNotFoundError(
+            f"{manifest_path} 없음. split_dataset.py를 먼저 실행하세요."
+        )
+
+    data_dir = Path(args.data_dir) if args.data_dir else None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -290,11 +315,14 @@ def main():
     print("\n데이터 로드 중...")
     t0 = time.perf_counter()
     train_ds = CotendDataset(split_dir / "train", name="train",
-                             workers=args.load_workers, rebuild_cache=args.rebuild_cache)
+                             workers=args.load_workers, rebuild_cache=args.rebuild_cache,
+                             data_dir=data_dir)
     val_ds   = CotendDataset(split_dir / "val",   name="val",
-                             workers=args.load_workers, rebuild_cache=args.rebuild_cache)
+                             workers=args.load_workers, rebuild_cache=args.rebuild_cache,
+                             data_dir=data_dir)
     test_ds  = CotendDataset(split_dir / "test",  name="test",
-                             workers=args.load_workers, rebuild_cache=args.rebuild_cache)
+                             workers=args.load_workers, rebuild_cache=args.rebuild_cache,
+                             data_dir=data_dir)
     print(f"  로드 완료: {time.perf_counter()-t0:.1f}s")
 
     n_train, n_val, n_test = len(train_ds), len(val_ds), len(test_ds)

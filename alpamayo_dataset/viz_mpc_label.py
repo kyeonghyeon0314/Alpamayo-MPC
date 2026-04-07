@@ -59,6 +59,7 @@ from mpc import (
     V_MIN_LIN, QP_REG, W_LAT_FIXED, WEIGHTS_DEFAULT,
     U_MIN, U_MAX,
     _make_QR, _linearize, _build_prediction_matrices, _solve_qp, run_mpc,
+    compute_x0,
 )
 
 
@@ -154,24 +155,33 @@ def plot_cell(ax, h5_path: Path):
     name = h5_path.name
 
     with h5py.File(h5_path, "r") as f:
-        gt_xyz     = f["gt/future_xyz"][:]
-        gt_ego     = f["gt/future_ego_states"][:]
-        hist       = f["input/ego_history_ego_states"][:]
+        gt_xyz    = f["gt/future_xyz"][:]
+        gt_ego    = f["gt/future_ego_states"][:]
+        hist      = f["input/ego_history_ego_states"][:]
+        hist_vel  = f["input/ego_history_vel"][:]
+        hist_curv = f["input/ego_history_curv"][:]
+        hist_quat = f["input/ego_history_quat_global"][:]
         w_opt      = f["labels/mpc_weights"][:]
         ade_stored = float(f["labels/ade"][()])
         valid      = bool(f["labels/valid"][()])
         sr_stored  = float(f["labels/steer_rate_rms"][()]) if "labels/steer_rate_rms" in f else None
         jr_stored  = float(f["labels/jerk_rms"][()])       if "labels/jerk_rms"       in f else None
 
-    v0       = float(hist[-1, 2])
+    speed    = float(hist[-1, 2])
+    x0       = compute_x0(speed, hist[-1, 4], hist_vel[-1], hist_curv[-1, 0], hist_quat[-1])
     gt_yaw   = gt_ego[:, 3]
     gt_xy    = gt_xyz[:N, :2]
 
-    xy_opt, _, _ = run_mpc(v0, gt_xyz, gt_yaw, w_opt)
+    xy_opt, _, _ = run_mpc(speed, gt_xyz, gt_yaw, w_opt, x0_full=x0)
 
     ax.plot(gt_xy[:, 1],  gt_xy[:, 0],  "g-",  lw=1.5, label="GT")
     ax.plot(xy_opt[:, 1], xy_opt[:, 0], "b--", lw=1.2, label="Opt")
     ax.scatter([0], [0], c="k", s=20, zorder=5)
+    _T_MARKS = [4, 9, 14, 19]
+    ax.scatter(gt_xy[_T_MARKS, 1], gt_xy[_T_MARKS, 0],
+               c="green", s=18, zorder=6, linewidths=0)
+    ax.scatter(xy_opt[_T_MARKS, 1], xy_opt[_T_MARKS, 0],
+               c="steelblue", s=18, zorder=6, linewidths=0)
 
     _set_traj_limits(ax, gt_xy, xy_opt)
     ax.grid(True, ls=":", lw=0.4)
@@ -182,7 +192,7 @@ def plot_cell(ax, h5_path: Path):
                     if sr_stored is not None else "")
     ax.set_title(
         f"{short_name}\n"
-        f"v0={v0:.1f} ADE={ade_stored:.3f}m {valid_mark}\n"
+        f"v0={speed:.1f} ADE={ade_stored:.3f}m {valid_mark}\n"
         f"w=[{w_opt[0]:.1f},{w_opt[2]:.2f},{w_opt[3]:.3f},{w_opt[4]:.2f}]"
         f"{comfort_line}",
         fontsize=5.5,
@@ -200,21 +210,25 @@ def plot_sample(ax_traj, ax_ctrl, h5_path):
     name = Path(h5_path).name
 
     with h5py.File(h5_path, "r") as f:
-        gt_xyz   = f["gt/future_xyz"][:]
-        gt_ego   = f["gt/future_ego_states"][:]
-        hist     = f["input/ego_history_ego_states"][:]
+        gt_xyz    = f["gt/future_xyz"][:]
+        gt_ego    = f["gt/future_ego_states"][:]
+        hist      = f["input/ego_history_ego_states"][:]
+        hist_vel  = f["input/ego_history_vel"][:]
+        hist_curv = f["input/ego_history_curv"][:]
+        hist_quat = f["input/ego_history_quat_global"][:]
         if "labels/mpc_weights" not in f:
             ax_traj.set_title(f"{name[:24]}\n[NO LABEL]", fontsize=7)
             return
         w_opt = f["labels/mpc_weights"][:]
 
-    v0       = float(hist[-1, 2])
+    speed    = float(hist[-1, 2])
+    x0       = compute_x0(speed, hist[-1, 4], hist_vel[-1], hist_curv[-1, 0], hist_quat[-1])
     gt_yaw   = gt_ego[:, 3]
     gt_xy    = gt_xyz[:N, :2]
     t_axis   = np.arange(1, N+1) * DT
 
-    xy_opt, U_opt, ade_opt = run_mpc(v0, gt_xyz, gt_yaw, w_opt)
-    xy_def, U_def, ade_def = run_mpc(v0, gt_xyz, gt_yaw, WEIGHTS_DEFAULT)
+    xy_opt, U_opt, ade_opt = run_mpc(speed, gt_xyz, gt_yaw, w_opt,          x0_full=x0)
+    xy_def, U_def, ade_def = run_mpc(speed, gt_xyz, gt_yaw, WEIGHTS_DEFAULT, x0_full=x0)
 
     sr_opt, jr_opt = _comfort_metrics(U_opt)
     sr_def, jr_def = _comfort_metrics(U_def)
@@ -223,12 +237,19 @@ def plot_sample(ax_traj, ax_ctrl, h5_path):
     ax_traj.plot(xy_opt[:, 1], xy_opt[:, 0], "b--", lw=1.5, label=f"Opt ADE={ade_opt:.3f}m")
     ax_traj.plot(xy_def[:, 1], xy_def[:, 0], "r:",  lw=1.2, label=f"Default ADE={ade_def:.3f}m")
     ax_traj.scatter([0], [0], c="k", s=30, zorder=5)
+    _T_MARKS = [4, 9, 14, 19]
+    ax_traj.scatter(gt_xy[_T_MARKS, 1], gt_xy[_T_MARKS, 0],
+                    c="green", s=20, zorder=6, linewidths=0)
+    ax_traj.scatter(xy_opt[_T_MARKS, 1], xy_opt[_T_MARKS, 0],
+                    c="steelblue", s=20, zorder=6, linewidths=0)
+    ax_traj.scatter(xy_def[_T_MARKS, 1], xy_def[_T_MARKS, 0],
+                    c="tomato", s=20, zorder=6, linewidths=0)
 
     _set_traj_limits(ax_traj, gt_xy, xy_opt, xy_def)
     ax_traj.set_xlabel("Y (lateral) [m]", fontsize=7)
     ax_traj.set_ylabel("X (long.) [m]",   fontsize=7)
     ax_traj.set_title(
-        f"{name[:30]}\nv0={v0:.1f}m/s  w=[{w_opt[0]:.1f},{w_opt[2]:.2f},{w_opt[3]:.3f},{w_opt[4]:.2f}]",
+        f"{name[:30]}\nv0={speed:.1f}m/s  w=[{w_opt[0]:.1f},{w_opt[2]:.2f},{w_opt[3]:.3f},{w_opt[4]:.2f}]",
         fontsize=7,
     )
     ax_traj.legend(fontsize=6, loc="best")
@@ -258,30 +279,34 @@ def plot_single(h5_path: Path, out_dir: Path):
     name = h5_path.stem
 
     with h5py.File(h5_path, "r") as f:
-        gt_xyz     = f["gt/future_xyz"][:]
-        gt_ego     = f["gt/future_ego_states"][:]
-        hist       = f["input/ego_history_ego_states"][:]
+        gt_xyz    = f["gt/future_xyz"][:]
+        gt_ego    = f["gt/future_ego_states"][:]
+        hist      = f["input/ego_history_ego_states"][:]
+        hist_vel  = f["input/ego_history_vel"][:]
+        hist_curv = f["input/ego_history_curv"][:]
+        hist_quat = f["input/ego_history_quat_global"][:]
         if "labels/mpc_weights" not in f:
             print(f"[WARN] {h5_path.name} has no labels/mpc_weights")
             return
         w_opt      = f["labels/mpc_weights"][:]
         ade_stored = float(f["labels/ade"][()])
 
-    v0     = float(hist[-1, 2])
-    gt_yaw = gt_ego[:, 3]
-    gt_xy  = gt_xyz[:N, :2]
-    t_axis = np.arange(1, N + 1) * DT
-    t_diff = t_axis[:-1]          # N-1 midpoints for diff-based plots
+    speed    = float(hist[-1, 2])
+    x0       = compute_x0(speed, hist[-1, 4], hist_vel[-1], hist_curv[-1, 0], hist_quat[-1])
+    gt_yaw   = gt_ego[:, 3]
+    gt_xy    = gt_xyz[:N, :2]
+    t_axis   = np.arange(1, N + 1) * DT
+    t_diff   = t_axis[:-1]          # N-1 midpoints for diff-based plots
 
-    xy_opt, U_opt, ade_opt = run_mpc(v0, gt_xyz, gt_yaw, w_opt)
-    xy_def, U_def, ade_def = run_mpc(v0, gt_xyz, gt_yaw, WEIGHTS_DEFAULT)
+    xy_opt, U_opt, ade_opt = run_mpc(speed, gt_xyz, gt_yaw, w_opt,          x0_full=x0)
+    xy_def, U_def, ade_def = run_mpc(speed, gt_xyz, gt_yaw, WEIGHTS_DEFAULT, x0_full=x0)
 
     sr_opt, jr_opt = _comfort_metrics(U_opt)
     sr_def, jr_def = _comfort_metrics(U_def)
 
     fig = plt.figure(figsize=(15, 11))
     fig.suptitle(
-        f"{h5_path.name}   v0={v0:.1f} m/s   stored ADE={ade_stored:.3f}m\n"
+        f"{h5_path.name}   v0={speed:.1f} m/s   stored ADE={ade_stored:.3f}m\n"
         f"Opt  ADE={ade_opt:.3f}m  SR={sr_opt:.4f}  Jerk={jr_opt:.4f}   |   "
         f"Def  ADE={ade_def:.3f}m  SR={sr_def:.4f}  Jerk={jr_def:.4f}",
         fontsize=9,
@@ -303,10 +328,18 @@ def plot_single(h5_path: Path, out_dir: Path):
     ax_traj.plot(xy_opt[:, 1], xy_opt[:, 0], "b--", lw=2.0, label=f"Opt  ADE={ade_opt:.3f}m")
     ax_traj.plot(xy_def[:, 1], xy_def[:, 0], "r:",  lw=1.8, label=f"Def  ADE={ade_def:.3f}m")
     ax_traj.scatter([0], [0], c="k", s=50, zorder=5, label="t0")
-    for k in [4, 9, 14, 19]:
+    
+    _T_MARKS = [4, 9, 14, 19]
+    for k in _T_MARKS:
         ax_traj.annotate(f"{(k+1)*DT:.1f}s",
                          xy=(gt_xy[k, 1], gt_xy[k, 0]), fontsize=6, color="green",
                          xytext=(3, 3), textcoords="offset points")
+    ax_traj.scatter(gt_xy[_T_MARKS, 1], gt_xy[_T_MARKS, 0],
+                    c="green", s=25, zorder=6, linewidths=0)
+    ax_traj.scatter(xy_opt[_T_MARKS, 1], xy_opt[_T_MARKS, 0],
+                    c="steelblue", s=25, zorder=6, linewidths=0)
+    ax_traj.scatter(xy_def[_T_MARKS, 1], xy_def[_T_MARKS, 0],
+                    c="tomato", s=25, zorder=6, linewidths=0)
     all_lat = np.concatenate([gt_xy[:, 1], xy_opt[:, 1], xy_def[:, 1], [0.]])
     all_lon = np.concatenate([gt_xy[:, 0], xy_opt[:, 0], xy_def[:, 0], [0.]])
     half = max(all_lat.max() - all_lat.min(), all_lon.max() - all_lon.min()) / 2 + 1.5

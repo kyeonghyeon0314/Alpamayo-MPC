@@ -73,6 +73,7 @@ from mpc import (
     IX, IY, IYAW,
     V_MIN_LIN, QP_REG, U_MIN, U_MAX, W_LAT_FIXED, TERMINAL_Q_FACTOR,
     _linearize, _build_prediction_matrices, _solve_qp, _build_delta_matrix,
+    compute_x0,
 )
 
 # ══════════════════════════════════════════════════════
@@ -94,16 +95,18 @@ _THETA_MIN = np.log([ 0.1,   0.1,   1.0,    0.2  ])
 _THETA_MAX = np.log([ 10.,   10.,   25.,    10.  ])
 _BOUNDS_LOG = list(zip(_THETA_MIN, _THETA_MAX))
 
-# Tikhonov 정규화 강도: ADE 개선이 기본값 근방 이탈 비용을 넘지 않으면 기본값 근방 유지
-# λ=0.002: degenerate 경계(||Δθ||²≈35)에서 ~0.07m 추가 비용 → ADE 대비 의미 있는 패널티
-_REG_LAMBDA = 0.002
+# Tikhonov 정규화 강도: 기본값 θ₀ 근처로 해를 당기는 편향 — 순수 ADE 최적화 시 0.0 사용
+# λ=0.002: degenerate 경계(||Δθ||²≈35)에서 ~0.07m 추가 비용 → CLI --reg-lambda로 설정
+# λ=0.0: 순수 ADE (bounds로 발산 방지 충분)
+_REG_LAMBDA = 0.0
 
-# ── 승차감 페널티 가중치 ─────────────────────────────────────
-# ADE [m] 와 스케일을 맞추기 위한 하이퍼파라미터 — CLI로 덮어쓰기 가능
-# steer_rate_rms 단위: [rad/step],  jerk_rms 단위: [(m/s²)/step]
-W_STEER_PENALTY: float = 0.5
-W_JERK_PENALTY:  float = 0.5
-
+# ── 목적함수 가중치 ──────────────────────────────────────────
+# 목적함수 = W_ADE_PENALTY * (ADE_xy + W_YAW_ADE * ADE_yaw)
+#           + λ * ||θ - θ₀||²
+# ADE_xy [m], ADE_yaw [rad]
+# W_YAW_ADE=0 이면 기존 xy-only ADE와 동일
+W_ADE_PENALTY: float = 1.0
+W_YAW_ADE:     float = 2.0   # yaw 오차 가중치 [rad → m 등가 스케일]
 
 # ══════════════════════════════════════════════════════
 # 핵심 클래스: 샘플별 MPC Labeler
@@ -126,15 +129,16 @@ class MPCLabeler:
       - 가중치 역산 목적에서 closed-loop과의 오차는 허용 범위 내
     """
 
-    def __init__(self, v0: float, gt_xyz: np.ndarray, gt_yaw: np.ndarray):
+    def __init__(self, x0: np.ndarray, gt_xy: np.ndarray, gt_yaw: np.ndarray):
         """
         Args:
-            v0:        t0 초기 속도 [m/s]   (ego_history_ego_states[-1, 2])
-            gt_xyz:    (≥N_LABEL, 3)  GT 미래 위치 (로컬 프레임, t0+0.1s부터)
-            gt_yaw:    (≥N_LABEL,)    GT 미래 yaw [rad]
+            x0:      (NX=8,) MPC 초기 상태 — compute_x0()로 생성
+                     [x=0, y=0, yaw=0, vx, vy, yaw_rate, steering, lon_accel]
+            gt_xy:   (≥N_LABEL, 2)  GT 미래 x, y (로컬 프레임, t0+0.1s부터)
+                     smooth_gt.py 실행 후 h5의 gt_smooth/future_xy 사용 권장
+            gt_yaw:  (≥N_LABEL,)    GT 미래 yaw [rad]
+                     smooth_gt.py 실행 후 h5의 gt_smooth/future_yaw 사용 권장
         """
-        # 초기 상태: 로컬 프레임 원점, 초기 속도 반영
-        x0 = np.array([0., 0., 0., max(v0, V_MIN_LIN), 0., 0., 0., 0.])
 
         A_d, B_d = _linearize(x0)
         self.S_x, self.S_u = _build_prediction_matrices(A_d, B_d, n=N_LABEL)
@@ -147,13 +151,14 @@ class MPCLabeler:
         # k=1..N_LABEL: GT 스텝 0..N_LABEL-1 (t0+0.1s ~ t0+2.0s)
         x_ref = np.zeros((N_LABEL + 1, NX))
         for k in range(1, N_LABEL + 1):
-            x_ref[k, IX]   = gt_xyz[k - 1, 0]
-            x_ref[k, IY]   = gt_xyz[k - 1, 1]
+            x_ref[k, IX]   = gt_xy[k - 1, 0]
+            x_ref[k, IY]   = gt_xy[k - 1, 1]
             x_ref[k, IYAW] = gt_yaw[k - 1]
         self._x_ref_flat = x_ref.flatten()
 
-        # ADE 계산용 GT xy: 첫 N_EVAL=15 스텝만 (1.5s) — 터미널 롤오프 배제
-        self._gt_xy = gt_xyz[:N_EVAL, :2].copy()
+        # ADE 계산용 GT: 첫 N_EVAL=15 스텝만 (1.5s) — 터미널 롤오프 배제
+        self._gt_xy  = gt_xy[:N_EVAL, :2].copy()     # (N_EVAL, 2)
+        self._gt_yaw = gt_yaw[:N_EVAL].copy()        # (N_EVAL,)
 
         # 입력 제약 (N_LABEL 스텝 전체)
         self._lb = np.tile(U_MIN, N_LABEL)   # (N_LABEL·NU,) = (60,)
@@ -200,55 +205,28 @@ class MPCLabeler:
                 R_b[k * NU + j, k * NU + j] = 1.0
             self._R_basis.append(_D.T @ R_b @ _D)
 
-        # 해석적 기울기용: 예측 XY 성분에 대한 S_u 슬라이스
-        # 전체 N_LABEL 행 중 첫 N_EVAL=15 행만 (ADE 평가 범위와 일치)
-        self._S_u_xy = self.S_u[NX:].reshape(N_LABEL, NX, NNU)[:N_EVAL, [IX, IY], :]  # (N_EVAL, 2, NNU)
+        # 해석적 기울기용: S_u 슬라이스 (첫 N_EVAL 행만)
+        _S_u_blk     = self.S_u[NX:].reshape(N_LABEL, NX, NNU)[:N_EVAL]  # (N_EVAL, NX, NNU)
+        self._S_u_xy  = _S_u_blk[:, [IX, IY], :]   # (N_EVAL, 2, NNU)
+        self._S_u_yaw = _S_u_blk[:, IYAW, :]        # (N_EVAL, NNU)
 
     # ── Objective ─────────────────────────────────────
 
     def rollout_ade(self, theta: np.ndarray) -> float:
         """
-        log-parameterized 가중치 theta (4,) → 정규화된 비용 [m].
+        log-parameterized 가중치 theta (4,) → 목적함수 값 [m 등가].
 
-        비용 = ADE(theta) + comfort_penalty(theta) + λ * ||theta - THETA0||²
+        목적함수 = W_ADE_PENALTY * (ADE_xy + W_YAW_ADE * ADE_yaw)
+                 + λ * ||theta - THETA0||²
 
-        comfort_penalty = W_STEER_PENALTY * steer_rate_rms
-                        + W_JERK_PENALTY  * jerk_rms
-          - steer_rate_rms: sqrt(mean(diff(U_steer)²))  [rad/step]
-          - jerk_rms:       sqrt(mean(diff(U_accel)²))  [(m/s²)/step]
+          ADE_xy  [m]   — 첫 N_EVAL=15 스텝 xy 평균 L2 거리
+          ADE_yaw [rad] — 첫 N_EVAL=15 스텝 yaw 평균 절대 오차
 
-        NOTE: comfort_penalty 는 U_opt 의 비선형 함수이므로
-        해석적 기울기(_rollout_val_and_grad)가 더 이상 성립하지 않는다.
-        최적화는 수치 미분(forward-diff)으로 폴백된다.
+        승차감 페널티(steer_rate_rms, jerk_rms)는 제거됨.
+        Smooth GT가 smooth한 yaw 레퍼런스를 제공하므로, 자연히 부드러운 제어가 유도됨.
         """
-        w = np.exp(np.clip(theta, -10., 10.))
-
-        # H = W_LAT*H[IY] + w[0]*H[IX] + w[1]*H[IYAW] + w[2]*R[steer] + w[3]*R[accel] + QP_REG*I
-        H = (self._H_lat                  # lat_position (고정)
-           + w[0] * self._H_Q_basis[0]   # long_position
-           + w[1] * self._H_Q_basis[2])  # heading
-        H += w[2] * self._R_basis[0] + w[3] * self._R_basis[1]
-        H  = 0.5 * (H + H.T) + QP_REG * np.eye(N_LABEL * NU)
-
-        g = (self._g_lat
-           + w[0] * self._g_Q_basis[0]
-           + w[1] * self._g_Q_basis[2])
-
-        U_opt   = _solve_qp(H, g, self._lb, self._ub)
-        X_pred  = self._x_free + self.S_u @ U_opt
-        # 첫 N_EVAL=15 스텝만 ADE 계산 (터미널 롤오프 배제)
-        xy_pred = X_pred[NX:].reshape(N_LABEL, NX)[:N_EVAL, [IX, IY]]   # (N_EVAL, 2)
-
-        ade = float(np.mean(np.linalg.norm(xy_pred - self._gt_xy, axis=1)))
-        reg = _REG_LAMBDA * float(np.sum((theta - THETA0) ** 2))
-
-        # ── 승차감 페널티 ─────────────────────────────────────
-        U_2d           = U_opt.reshape(N_LABEL, NU)
-        steer_rate_rms = float(np.sqrt(np.mean(np.diff(U_2d[:, 0]) ** 2)))
-        jerk_rms       = float(np.sqrt(np.mean(np.diff(U_2d[:, 1]) ** 2)))
-        comfort_penalty = W_STEER_PENALTY * steer_rate_rms + W_JERK_PENALTY * jerk_rms
-
-        return ade + comfort_penalty + reg
+        val, _ = self._rollout_val_and_grad(theta)
+        return val
 
     def _compute_comfort_metrics(self, theta: np.ndarray) -> tuple[float, float]:
         """
@@ -275,13 +253,8 @@ class MPCLabeler:
         jerk_rms       = float(np.sqrt(np.mean(np.diff(U_2d[:, 1]) ** 2)))
         return steer_rate_rms, jerk_rms
 
-    def _compute_pure_ade(self, theta: np.ndarray) -> float:
-        """
-        순수 궤적 추종 ADE만 반환 (comfort_penalty · reg 제외).
-
-        h5 저장 및 --ade-threshold 필터링 전용.
-        최적화 목적함수로는 사용하지 않는다.
-        """
+    def _compute_ade_xy(self, theta: np.ndarray) -> float:
+        """xy-only ADE [m] — h5 저장 및 ade-threshold 필터링 전용."""
         w = np.exp(np.clip(theta, -10., 10.))
 
         H = (self._H_lat
@@ -299,22 +272,85 @@ class MPCLabeler:
         xy_pred = X_pred[NX:].reshape(N_LABEL, NX)[:N_EVAL, [IX, IY]]
         return float(np.mean(np.linalg.norm(xy_pred - self._gt_xy, axis=1)))
 
-    # ── Gradient (numerical fallback only) ───────────────
+    # ── Value + Analytical Gradient ──────────────────────
 
     def _rollout_val_and_grad(
         self, theta: np.ndarray
     ) -> tuple[float, np.ndarray | None]:
-        """rollout_ade 값을 반환하고 기울기는 항상 None.
+        """목적함수 값과 해석적 기울기를 동시에 반환.
 
-        comfort_penalty = W_STEER * steer_rate_rms + W_JERK * jerk_rms 는
-        U_opt 의 비선형 함수이므로 기존 해석적 기울기 공식
-          dADE/dθᵢ = -wᵢ · (H⁻¹ grad_U) @ (dH/dwᵢ U* + dg/dwᵢ)
-        이 더 이상 성립하지 않는다.
+        목적함수:
+          J = W_ADE * (ADE_xy + W_YAW * ADE_yaw) + λ||θ-θ₀||²
 
-        → 항상 (val, None) 반환 → _obj 에서 forward-diff 수치 미분 사용.
-        속도는 ~5× 감소하지만, 정답 데이터 품질을 위해 수용한다.
+        해석적 기울기 (제약 비활성 케이스):
+          U* = -H⁻¹ g  →  dU*/dθᵢ = -H⁻¹ vᵢ  (vᵢ = dH/dθᵢ·U* + dg/dθᵢ)
+          grad_U = dJ/dU* = W_ADE*(dADE_xy/dU* + W_YAW*dADE_yaw/dU*)
+          dJ/dθᵢ = -grad_U · H⁻¹vᵢ
+
+        제약 활성 케이스: None 반환 → _obj 에서 수치 미분 폴백.
         """
-        return self.rollout_ade(theta), None
+        w = np.exp(np.clip(theta, -10., 10.))
+
+        H = (self._H_lat
+           + w[0] * self._H_Q_basis[0]
+           + w[1] * self._H_Q_basis[2])
+        H += w[2] * self._R_basis[0] + w[3] * self._R_basis[1]
+        H  = 0.5 * (H + H.T) + QP_REG * np.eye(N_LABEL * NU)
+
+        g = (self._g_lat
+           + w[0] * self._g_Q_basis[0]
+           + w[1] * self._g_Q_basis[2])
+
+        U_opt  = _solve_qp(H, g, self._lb, self._ub)
+        X_pred = self._x_free + self.S_u @ U_opt
+        Xr     = X_pred[NX:].reshape(N_LABEL, NX)
+
+        xy_pred  = Xr[:N_EVAL, [IX, IY]]   # (N_EVAL, 2)
+        yaw_pred = Xr[:N_EVAL, IYAW]       # (N_EVAL,)
+
+        e_xy  = xy_pred  - self._gt_xy     # (N_EVAL, 2)
+        e_yaw = yaw_pred - self._gt_yaw    # (N_EVAL,)
+
+        norms   = np.linalg.norm(e_xy, axis=1)          # (N_EVAL,)
+        ade_xy  = float(np.mean(norms))
+        ade_yaw = float(np.mean(np.abs(e_yaw)))
+        reg     = _REG_LAMBDA * float(np.sum((theta - THETA0) ** 2))
+        val     = W_ADE_PENALTY * (ade_xy + W_YAW_ADE * ade_yaw) + reg
+
+        # ── 제약 활성 여부 확인 → 활성 시 수치 미분 폴백 ──────
+        _TOL = 1e-4
+        if np.any(U_opt <= self._lb + _TOL) or np.any(U_opt >= self._ub - _TOL):
+            return val, None
+
+        # ── 해석적 기울기 ──────────────────────────────────────
+        NNU = N_LABEL * NU
+
+        # dADE_xy/dU*: (NNU,)
+        safe_norms  = np.maximum(norms, 1e-6)
+        e_xy_normed = e_xy / safe_norms[:, None]              # (N_EVAL, 2)
+        d_xy_dU     = np.einsum('ki,kij->j', e_xy_normed, self._S_u_xy) / N_EVAL
+
+        # dADE_yaw/dU*: (NNU,)
+        d_yaw_dU = (np.sign(e_yaw) @ self._S_u_yaw) / N_EVAL
+
+        # 목적함수의 U* 기울기
+        grad_U = W_ADE_PENALTY * (d_xy_dU + W_YAW_ADE * d_yaw_dU)  # (NNU,)
+
+        # vᵢ = dH/dθᵢ · U* + dg/dθᵢ  (NNU, 4)
+        V = np.column_stack([
+            w[0] * (self._H_Q_basis[0] @ U_opt + self._g_Q_basis[0]),  # long
+            w[1] * (self._H_Q_basis[2] @ U_opt + self._g_Q_basis[2]),  # yaw
+            w[2] * (self._R_basis[0]   @ U_opt),                        # steer_r
+            w[3] * (self._R_basis[1]   @ U_opt),                        # accel_r
+        ])
+
+        # dJ/dθᵢ = -grad_U · H⁻¹ vᵢ  (solve 4 RHS at once)
+        grad = -(grad_U @ np.linalg.solve(H, V))   # (4,)
+
+        if _REG_LAMBDA > 0:
+            grad += 2.0 * _REG_LAMBDA * (theta - THETA0)
+
+        return val, grad
 
     # ── Outer Optimization ────────────────────────────
 
@@ -373,21 +409,19 @@ class MPCLabeler:
             w_opt[0], W_LAT_FIXED, w_opt[1], w_opt[2], w_opt[3],
         ], dtype=np.float32)
 
-        # h5 저장·필터링용 순수 ADE (comfort_penalty·reg 제외)
-        pure_ade = self._compute_pure_ade(res.x)
-
-        # 최적 가중치에서의 승차감 지표
+        # h5 저장·필터링용 지표 (reg 제외)
+        ade_xy  = self._compute_ade_xy(res.x)           # xy-only [m]
         steer_rate_rms, jerk_rms = self._compute_comfort_metrics(res.x)
 
         return {
             "weights":        weights,
-            "ade":            pure_ade,           # 순수 궤적 추종 ADE [m]
-            "objective":      float(res.fun),     # 최적화 목적함수 (ADE+comfort+reg)
+            "ade":            ade_xy,             # xy ADE [m] — threshold 필터링 기준
+            "objective":      float(res.fun),     # 최적화 목적함수 값 (ADE_xy+W_YAW*ADE_yaw+reg)
             "success":        bool(res.success),
             "n_evals":        int(res.nfev),
             "elapsed_s":      elapsed,
-            "steer_rate_rms": steer_rate_rms,     # [rad/step]
-            "jerk_rms":       jerk_rms,           # [(m/s²)/step]
+            "steer_rate_rms": steer_rate_rms,     # [rad/step] — 모니터링용
+            "jerk_rms":       jerk_rms,           # [(m/s²)/step] — 모니터링용
         }
 
 
@@ -395,11 +429,12 @@ class MPCLabeler:
 # 멀티프로세싱 Worker 초기화
 # ══════════════════════════════════════════════════════
 
-def _init_worker(w_steer: float, w_jerk: float) -> None:
-    """Pool worker 프로세스에서 comfort penalty 가중치를 전역 변수로 설정."""
-    global W_STEER_PENALTY, W_JERK_PENALTY
-    W_STEER_PENALTY = w_steer
-    W_JERK_PENALTY  = w_jerk
+def _init_worker(w_ade: float, w_yaw: float, reg_lambda: float) -> None:
+    """Pool worker 프로세스에서 objective 가중치를 전역 변수로 설정."""
+    global W_ADE_PENALTY, W_YAW_ADE, _REG_LAMBDA
+    W_ADE_PENALTY = w_ade
+    W_YAW_ADE     = w_yaw
+    _REG_LAMBDA   = reg_lambda
 
 
 # ══════════════════════════════════════════════════════
@@ -435,16 +470,25 @@ def _label_one(args: tuple) -> dict:
 
     try:
         with h5py.File(h5_path, "r") as f:
-            gt_xyz = f["gt/future_xyz"][:]                # (64, 3)
-            gt_ego = f["gt/future_ego_states"][:]         # (64, 5) [x,y,speed,yaw,lon_accel]
-            hist   = f["input/ego_history_ego_states"][:]  # (16, 5)
+            hist      = f["input/ego_history_ego_states"][:]  # (16, 5)
+            hist_vel  = f["input/ego_history_vel"][:]          # (16, 3) global frame
+            hist_curv = f["input/ego_history_curv"][:]         # (16, 1)
+            hist_quat = f["input/ego_history_quat_global"][:]  # (16, 4) [qx,qy,qz,qw]
 
-        # t0 초기 상태
-        v0       = float(hist[-1, 2])
-        gt_yaw   = gt_ego[:, 3]
-        # (gt_accel / accel0 제거)
-        labeler = MPCLabeler(v0, gt_xyz, gt_yaw)
-        opt = labeler.optimize(max_iter=max_iter)
+            # GT 소스: gt_smooth/ 우선, 없으면 raw gt/ 폴백
+            if "gt_smooth" in f:
+                gt_xy  = f["gt_smooth/future_xy"][:]           # (64, 2)
+                gt_yaw = f["gt_smooth/future_yaw"][:]          # (64,)
+            else:
+                gt_xyz = f["gt/future_xyz"][:]                 # (64, 3)
+                gt_ego = f["gt/future_ego_states"][:]          # (64, 5)
+                gt_xy  = gt_xyz[:, :2]
+                gt_yaw = gt_ego[:, 3]
+
+        # t0 초기 상태 복원
+        x0      = compute_x0(hist[-1, 2], hist[-1, 4], hist_vel[-1], hist_curv[-1, 0], hist_quat[-1])
+        labeler = MPCLabeler(x0, gt_xy, gt_yaw)
+        opt     = labeler.optimize(max_iter=max_iter)
 
         # h5에 결과 저장
         with h5py.File(h5_path, "a") as f:
@@ -453,20 +497,18 @@ def _label_one(args: tuple) -> dict:
                         "steer_rate_rms", "jerk_rms"]:
                 if key in grp:
                     del grp[key]
-            grp.create_dataset("mpc_weights",     data=opt["weights"])
-            grp.create_dataset("ade",             data=np.float32(opt["ade"]))
-            grp.create_dataset("valid",           data=bool(opt["ade"] < ade_threshold))
-            grp.create_dataset("n_evals",         data=np.int32(opt["n_evals"]))
-            grp.create_dataset("steer_rate_rms",  data=np.float32(opt["steer_rate_rms"]))
-            grp.create_dataset("jerk_rms",        data=np.float32(opt["jerk_rms"]))
+            grp.create_dataset("mpc_weights",    data=opt["weights"])
+            grp.create_dataset("ade",            data=np.float32(opt["ade"]))
+            grp.create_dataset("valid",          data=bool(opt["ade"] < ade_threshold))
+            grp.create_dataset("n_evals",        data=np.int32(opt["n_evals"]))
+            grp.create_dataset("steer_rate_rms", data=np.float32(opt["steer_rate_rms"]))
+            grp.create_dataset("jerk_rms",       data=np.float32(opt["jerk_rms"]))
 
         status = "ok" if opt["ade"] < ade_threshold else "filtered"
 
         logging.debug(
-            "%s | ADE=%.4f m | steer_rate_rms=%.4f rad/step | jerk_rms=%.4f (m/s²)/step"
-            " | nfev=%d | %.2fs",
-            name, opt["ade"],
-            opt["steer_rate_rms"], opt["jerk_rms"],
+            "%s | ADE_xy=%.4f m | steer_rms=%.4f | jerk_rms=%.4f | nfev=%d | %.2fs",
+            name, opt["ade"], opt["steer_rate_rms"], opt["jerk_rms"],
             opt["n_evals"], opt["elapsed_s"],
         )
 
@@ -506,20 +548,28 @@ def main():
     parser.add_argument("--dry-run",        action="store_true",     help="랜덤 샘플 N개만 처리 (페널티 튜닝 확인용)")
     parser.add_argument("--dry-run-n",      type=int,   default=100, help="dry-run 샘플 수 (default: 100)")
     parser.add_argument("--seed",           type=int,   default=None, help="랜덤 시드 (dry-run 시나리오 비교용)")
-    parser.add_argument("--w-steer-penalty", type=float, default=15,
-                        help=f"steering rate RMS 페널티 가중치 (default: {15})")
-    parser.add_argument("--w-jerk-penalty",  type=float, default=1.5,
-                        help=f"jerk RMS 페널티 가중치 (default: {1.5})")
+    parser.add_argument("--w-ade-penalty", type=float, default=1.0,
+                        help="ADE 전체 스케일 가중치 (default: 1.0)")
+    parser.add_argument("--w-yaw-ade",    type=float, default=2.0,
+                        help="yaw ADE 가중치 [rad → m 등가] (default: 2.0, 0=xy-only)")
+    parser.add_argument("--reg-lambda",   type=float, default=0.0,
+                        help="Tikhonov 정규화 강도 λ (default: 0.0)")
+    parser.add_argument("--viz-n",        type=int,   default=6,
+                        help="레이블링 후 시각화할 랜덤 샘플 수 (default: 6, 0=생략)")
+    parser.add_argument("--viz-dir",      type=str,   default=None,
+                        help="시각화 PNG 저장 경로 (default: --data-dir/viz)")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
 
-    # ── comfort penalty 가중치 설정 ──────────────────────────────
-    W_STEER_PENALTY = args.w_steer_penalty
-    W_JERK_PENALTY  = args.w_jerk_penalty
+    # ── objective 가중치 설정 (main 프로세스용) ──────────────────
+    global W_ADE_PENALTY, W_YAW_ADE, _REG_LAMBDA
+    W_ADE_PENALTY = args.w_ade_penalty
+    W_YAW_ADE     = args.w_yaw_ade
+    _REG_LAMBDA   = args.reg_lambda
     logging.info(
-        "comfort penalty  w_steer=%.3f  w_jerk=%.3f",
-        W_STEER_PENALTY, W_JERK_PENALTY,
+        "objective  w_ade=%.3f  w_yaw_ade=%.3f  reg_lambda=%.4f",
+        W_ADE_PENALTY, W_YAW_ADE, _REG_LAMBDA,
     )
 
     if args.dry_run:
@@ -585,7 +635,7 @@ def main():
         with mp.Pool(
             processes=args.workers,
             initializer=_init_worker,
-            initargs=(W_STEER_PENALTY, W_JERK_PENALTY),
+            initargs=(W_ADE_PENALTY, W_YAW_ADE, _REG_LAMBDA),
         ) as pool:
             _run_with_progress(
                 pool.imap_unordered(_label_one, tasks, chunksize=1),
@@ -647,6 +697,42 @@ def main():
         _save_index(data_dir, updated)
         logging.info("인덱스 업데이트: %d개 → %s", len(updated), data_dir / _INDEX_FILE)
 
+    # ── 시각화 (성공 샘플 랜덤 N개) ────────────────────
+    if args.viz_n > 0:
+        viz_dir = Path(args.viz_dir) if args.viz_dir else data_dir / "viz"
+        _save_label_viz(
+            ok_paths=[Path(r["path"]) for r in by_status["ok"]],
+            viz_dir=viz_dir,
+            n=args.viz_n,
+            seed=args.seed if args.seed is not None else 42,
+        )
+
+
+def _save_label_viz(
+    ok_paths: list[Path],
+    viz_dir:  Path,
+    n:        int,
+    seed:     int,
+) -> None:
+    """성공 샘플 중 랜덤 n개를 viz_mpc_label.plot_single로 PNG 저장."""
+    if not ok_paths:
+        logging.warning("No labeled samples to visualize.")
+        return
+
+    import random as _rnd
+    rng = _rnd.Random(seed)
+    samples = rng.sample(ok_paths, min(n, len(ok_paths)))
+
+    # viz_mpc_label은 같은 디렉토리에 있음
+    from viz_mpc_label import plot_single
+
+    viz_dir.mkdir(parents=True, exist_ok=True)
+    for h5_path in samples:
+        try:
+            plot_single(h5_path, viz_dir)
+            logging.info("Viz saved: %s", viz_dir / f"{h5_path.stem}_mpc_viz.png")
+        except Exception as e:
+            logging.warning("Viz failed %s — %s", h5_path.name, e)
 
 
 if __name__ == "__main__":

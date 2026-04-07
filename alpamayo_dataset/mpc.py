@@ -8,6 +8,7 @@ label_mpc_weights.py / viz_mpc_label.py / test.py 공통 사용:
   - Condensed 예측 행렬 구성
   - QP 솔버 (unconstrained → L-BFGS-B fallback)
   - run_mpc() 고수준 인터페이스
+  - compute_x0() h5 raw egomotion → MPC 초기 상태 복원
 
 N (=20)     : 추론 / 시각화 호라이즌 (2s, 10Hz)
 N_LABEL     : label_mpc_weights.py 전용 — N과 동일 (=20)
@@ -23,6 +24,7 @@ import math
 import numpy as np
 import scipy.linalg
 import scipy.optimize
+from scipy.spatial.transform import Rotation as _Rotation
 
 # ══════════════════════════════════════════════════════
 # MPC 파라미터
@@ -208,6 +210,44 @@ def _solve_qp(
         options={"ftol": 1e-9, "gtol": 1e-6, "maxiter": 200},
     )
     return res.x
+
+
+def compute_x0(
+    speed: float,
+    lon_accel: float,
+    vel_global: np.ndarray,
+    curv: float,
+    quat: np.ndarray,
+) -> np.ndarray:
+    """h5 raw egomotion → MPC 초기 상태 벡터 x0 (NX=8).
+
+    t0 시점의 로컬 프레임 (x=y=yaw=0) 기준으로 나머지 5개 상태를 복원한다.
+
+    Args:
+        speed:      ego_history_ego_states[-1, 2]  종방향 속도 [m/s]
+        lon_accel:  ego_history_ego_states[-1, 4]  종방향 가속도 [m/s²]
+        vel_global: ego_history_vel[-1]             (3,) 전역 좌표계 속도 [vx,vy,vz]
+        curv:       ego_history_curv[-1, 0]         경로 곡률 [1/m]
+        quat:       ego_history_quat_global[-1]     (4,) [qx,qy,qz,qw] 전역 자세
+
+    Returns:
+        x0: (NX=8,) [x=0, y=0, yaw=0, vx, vy, yaw_rate, steering, lon_accel]
+
+    Notes:
+        vy       — global vel을 body frame으로 회전 변환 후 y 성분
+        yaw_rate — κ × vx  (경로 곡률 × 종방향 속도)
+        steering — arctan(κ × WB)  (운동학적 자전거 모델 전륜 조향각)
+    """
+    vx = max(speed, V_MIN_LIN)
+
+    # global frame → vehicle body frame
+    vel_body = _Rotation.from_quat(quat).inv().apply(vel_global)
+    vy = float(vel_body[1])
+
+    yaw_rate = float(curv) * vx
+    steering = float(np.arctan(float(curv) * WB))
+
+    return np.array([0., 0., 0., vx, vy, yaw_rate, steering, float(lon_accel)])
 
 
 def run_mpc(

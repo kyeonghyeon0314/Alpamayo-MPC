@@ -47,9 +47,9 @@ import torch
 
 # 공유 MPC 모듈 / 시각화 유틸 / MLP 모델 임포트 (같은 디렉토리)
 sys.path.insert(0, str(Path(__file__).parent))
-from mpc import run_mpc, WEIGHTS_DEFAULT, W_LAT_FIXED, N, DT, NX, IX, IY
+from mpc import run_mpc, WEIGHTS_DEFAULT, W_LAT_FIXED, N, DT, NX, IX, IY, compute_x0
 from viz_mpc_label import _set_traj_limits, _comfort_metrics
-from model import CotendMLP, PREDICT_IDX, load_mlp
+from model import CotendMLP, PREDICT_IDX, load_mlp, LOG_MIN, LOG_MAX
 
 
 # ══════════════════════════════════════════════════════
@@ -62,7 +62,8 @@ def _to_weights5(log_theta: np.ndarray) -> np.ndarray:
     PREDICT_IDX = [0, 2, 3, 4] 이므로 index 1(lat_pos)에 W_LAT_FIXED 삽입.
     weights5 순서: [long, lat(fixed), heading, steer_r, accel_r]
     """
-    w4 = np.exp(log_theta.astype(np.float64))
+    log_theta = np.clip(log_theta.astype(np.float64), LOG_MIN, LOG_MAX)  # 훈련 범위 밖 외삽 방지
+    w4 = np.exp(log_theta)
     return np.array([w4[0], W_LAT_FIXED, w4[1], w4[2], w4[3]])
 
 
@@ -92,26 +93,30 @@ def plot_mlp_single(h5_path: Path, model: CotendMLP, device: torch.device, out_d
 
     # ── 데이터 로드 ───────────────────────────────────
     with h5py.File(h5_path, "r") as f:
-        gt_xyz   = f["gt/future_xyz"][:]
-        gt_ego   = f["gt/future_ego_states"][:]
-        hist     = f["input/ego_history_ego_states"][:]
-        cotend   = f["output/cotend_hidden_state"][:]
-        has_opt  = "labels/mpc_weights" in f
-        w_opt    = f["labels/mpc_weights"][:] if has_opt else None
+        gt_xyz    = f["gt/future_xyz"][:]
+        gt_ego    = f["gt/future_ego_states"][:]
+        hist      = f["input/ego_history_ego_states"][:]
+        hist_vel  = f["input/ego_history_vel"][:]
+        hist_curv = f["input/ego_history_curv"][:]
+        hist_quat = f["input/ego_history_quat_global"][:]
+        cotend    = f["output/cotend_hidden_state"][:]
+        has_opt   = "labels/mpc_weights" in f
+        w_opt     = f["labels/mpc_weights"][:] if has_opt else None
         ade_stored = float(f["labels/ade"][()]) if has_opt else float("nan")
 
-    v0       = float(hist[-1, 2])
+    speed    = float(hist[-1, 2])
+    x0       = compute_x0(speed, hist[-1, 4], hist_vel[-1], hist_curv[-1, 0], hist_quat[-1])
     gt_yaw   = gt_ego[:, 3]
     gt_xy    = gt_xyz[:N, :2]
     t_axis   = np.arange(1, N + 1) * DT
 
     # ── MPC 실행 ──────────────────────────────────────
     w_mlp = predict_weights(model, cotend, device)
-    xy_mlp, U_mlp, ade_mlp = run_mpc(v0, gt_xyz, gt_yaw, w_mlp)
-    xy_def, U_def, ade_def = run_mpc(v0, gt_xyz, gt_yaw, WEIGHTS_DEFAULT)
+    xy_mlp, U_mlp, ade_mlp = run_mpc(speed, gt_xyz, gt_yaw, w_mlp,        x0_full=x0)
+    xy_def, U_def, ade_def = run_mpc(speed, gt_xyz, gt_yaw, WEIGHTS_DEFAULT, x0_full=x0)
 
     if has_opt:
-        xy_opt, U_opt, ade_opt = run_mpc(v0, gt_xyz, gt_yaw, w_opt)
+        xy_opt, U_opt, ade_opt = run_mpc(speed, gt_xyz, gt_yaw, w_opt, x0_full=x0)
     else:
         xy_opt = U_opt = None
         ade_opt = float("nan")

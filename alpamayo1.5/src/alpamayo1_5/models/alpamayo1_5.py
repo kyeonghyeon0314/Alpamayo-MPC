@@ -270,6 +270,22 @@ class Alpamayo1_5(ReasoningVLA):
         generation_config.top_k = top_k
         generation_config.pad_token_id = self.tokenizer.pad_token_id
 
+        # Lightweight cotend hidden state capture via lm_head pre-hook.
+        # StopAfterEOS generates <traj_future_start> then one extra token, so after
+        # generation _cotend_buf[0] holds the lm_head input that produced EOS
+        # (the second-to-last lm_head call).  Memory cost: 2 x (b_star, hidden_size).
+        capture_cotend = kwargs.get("return_cotend_hidden_state", False)
+        cotend_hs = None
+        _cotend_buf = [None, None]
+        if capture_cotend:
+            def _lm_head_pre_hook(module, args):
+                # args[0]: (b_star, seq_len, hidden_size) — seq_len=prompt_len at
+                # prefill, 1 at each decode step.  [:, -1, :] works for both.
+                hs = args[0][:, -1, :].detach().float().clone()
+                _cotend_buf[0] = _cotend_buf[1]
+                _cotend_buf[1] = hs
+            _hook_handle = self.vlm.lm_head.register_forward_pre_hook(_lm_head_pre_hook)
+
         # use custom stopping criteria to stop after EOS token + one more token,
         # because the KV cache is updated after the next token is generated
         eos_token_id = self.tokenizer.convert_tokens_to_ids(to_special_token("traj_future_start"))
@@ -282,13 +298,19 @@ class Alpamayo1_5(ReasoningVLA):
                 )
             ]
         )
-        vlm_outputs = self.vlm.generate(
-            input_ids=input_ids,
-            generation_config=generation_config,
-            stopping_criteria=stopping_criteria,
-            logits_processor=logits_processor,
-            **tokenized_data,
-        )
+        try:
+            vlm_outputs = self.vlm.generate(
+                input_ids=input_ids,
+                generation_config=generation_config,
+                stopping_criteria=stopping_criteria,
+                logits_processor=logits_processor,
+                **tokenized_data,
+            )
+        finally:
+            if capture_cotend:
+                _hook_handle.remove()
+                cotend_hs = _cotend_buf[0]  # None if fewer than 2 lm_head calls
+
         vlm_outputs.rope_deltas = self.vlm.model.rope_deltas
 
         # manually replace padding after EOS token
@@ -307,6 +329,7 @@ class Alpamayo1_5(ReasoningVLA):
             eos_token_id=eos_token_id,
             device=device,
         )
+
         prefix_mask = tokenized_data.get("attention_mask")
         if prefix_mask is not None:
             prefix_mask = torch.repeat_interleave(prefix_mask, n_samples_total, dim=0)
@@ -397,6 +420,8 @@ class Alpamayo1_5(ReasoningVLA):
                 extra[text_tokens] = np.array(extra[text_tokens]).reshape(
                     [input_ids.shape[0], num_traj_sets, num_traj_samples]
                 )
+            if cotend_hs is not None:
+                extra["cotend_hidden_state"] = cotend_hs
             return pred_xyz, pred_rot, extra
         return pred_xyz, pred_rot
 
