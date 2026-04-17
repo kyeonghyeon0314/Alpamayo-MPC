@@ -1,0 +1,63 @@
+# Onboarding
+
+Alpasim depends on access to the following:
+
+- Hugging Face access
+  - Used for downloading simulation artifacts
+  - Data is
+    [here](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles-NuRec/tree/main/sample_set/25.07_release)
+  - See info on data
+    [here](https://huggingface.co/datasets/nvidia/PhysicalAI-Autonomous-Vehicles-NuRec/blob/main/README.md#dataset-format)
+    for more information on the contents of artifacts used to define scenes
+  - You will need to create a free Hugging Face account if you do not already have one and create an
+    access token with read access. See [access tokens](https://huggingface.co/settings/tokens).
+  - Once you have the token, set it as an environment variable: `export HF_TOKEN=<token>`
+- A version of `uv` installed (see [here](https://docs.astral.sh/uv/getting-started/installation/))
+  - Example installation command for Ubuntu: `curl -LsSf https://astral.sh/uv/install.sh | sh`.
+- Rust toolchain (`cargo`) for building `utils_rs`, a compiled extension that accelerates trajectory
+  transformations and interpolations in the runtime. Install via
+  [rustup](https://rustup.rs/) or let `setup_local_env.sh` install it for you.
+- Docker installed (see [setup instructions](https://docs.docker.com/engine/install/ubuntu/))
+- Docker compose installed (see
+  [setup instructions](https://docs.docker.com/compose/install/linux/))
+  - The wizard needs `docker`, `docker-compose-plugin`, and `docker-buildx-plugin`
+  - Docker needs to be able to run without `sudo`. If you see a permission error when running
+    `docker` commands, add yourself to the docker group: `sudo usermod -aG docker $USER`
+- CUDA 12.6 or greater installed (see [here](https://developer.nvidia.com/cuda-downloads) for
+  instructions)
+- Install the NVIDIA Container Toolkit (see
+  [here](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html))
+
+## Dependency management
+
+The repo is a [uv workspace](https://docs.astral.sh/uv/concepts/workspaces/). All packages under `src/` and `plugins/` are workspace members sharing a single lockfile (`uv.lock`). The root `pyproject.toml` has empty `dependencies`, so a bare `uv sync` installs nothing -- this is intentional to avoid pulling heavy dependencies (torch, warp-lang) by default.
+
+Each workspace member is exposed as a named optional dependency extra, enabling composable installs from the repo root:
+
+```bash
+# Recommended for local development (compiles protos, installs all core + transfuser_driver plugin)
+source setup_local_env.sh
+
+# Or install selectively:
+uv sync --extra wizard                           # wizard + transitive deps only
+uv sync --extra all                              # all core packages
+uv sync --extra all --extra transfuser_driver    # core + transfuser_driver plugin
+
+# Single-package install from a subdirectory also works:
+cd src/wizard && uv sync
+```
+
+Use `uv run` to execute commands in the workspace environment:
+
+```bash
+uv run pytest                                # run tests
+uv run alpasim_wizard +deploy=local ...      # run the wizard
+uv run --project src/runtime python -c "..." # run in a sub-project context
+```
+
+All members share one dependency resolution; there is no per-member version isolation. See [Plugin System](PLUGIN_SYSTEM.md) for how plugins integrate with the workspace.
+
+## Next steps
+
+Once you have access to the above, please follow instructions in the [tutorial](TUTORIAL.md)
+to get started running Alpasim.
