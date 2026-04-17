@@ -157,7 +157,7 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dataset-dir",
-        default="/workspace/alpamayo_dataset/data/nvidia_test_scenario",
+        default="/workspace/Alpamayo-MPC/alpamayo_dataset/data/nvidia_test_scenario",
         metavar="DIR",
         help="로컬 데이터셋 디렉토리 (기본: /workspace/alpamayo_dataset/data/nvidia_test_scenario)",
     )

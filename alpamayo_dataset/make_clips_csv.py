@@ -43,8 +43,8 @@ import pandas as pd
 
 
 # ── 기본 경로 ─────────────────────────────────────────────────────────────────
-_DATASET_DIR = pathlib.Path("/workspace/alpamayo_dataset/data/nvidia_test_scenario")
-_OUTPUT_CSV  = pathlib.Path("/workspace/alpamayo_dataset/data/clips.csv")
+_DATASET_DIR = pathlib.Path("/workspace/Alpamayo-MPC/alpamayo_dataset/data/nvidia_test_scenario")
+_OUTPUT_CSV  = pathlib.Path("/workspace/Alpamayo-MPC/alpamayo_dataset/data/clips.csv")
 
 # t0_us 유효 범위 (클립 내 상대 타임스탬프, 마이크로초)
 #   클립 길이: 20,000,000 us (20초)
