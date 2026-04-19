@@ -188,7 +188,7 @@ class AlpamayoDatasetCollector:
         # 1. 모델 입력 준비 + 추론 (cotend hidden state는 모델 내부 hook으로 extra에 포함)
         log.info("  [2/4] 추론 중  (VLM CoC 생성 → Diffusion 샘플링)...")
         model_inputs = self._prepare_inputs(raw)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             pred_xyz, pred_rot, extra = (
                 self.model.sample_trajectories_from_data_with_vlm_rollout(
                     data=model_inputs,
@@ -216,6 +216,7 @@ class AlpamayoDatasetCollector:
         _write_hdf5(sample, out_path)
         log.info("        → %s", out_path.name)
 
+        torch.cuda.empty_cache()
         return out_path
 
     # ------------------------------------------------------------------
