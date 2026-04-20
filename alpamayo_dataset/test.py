@@ -112,11 +112,11 @@ def plot_mlp_single(h5_path: Path, model: CotendMLP, device: torch.device, out_d
 
     # ── MPC 실행 ──────────────────────────────────────
     w_mlp = predict_weights(model, cotend, device)
-    xy_mlp, U_mlp, ade_mlp = run_mpc(speed, gt_xyz, gt_yaw, w_mlp,        x0_full=x0)
-    xy_def, U_def, ade_def = run_mpc(speed, gt_xyz, gt_yaw, WEIGHTS_DEFAULT, x0_full=x0)
+    xy_mlp, _, _, _, U_mlp, ade_mlp = run_mpc(speed, gt_xyz, gt_yaw, w_mlp,        x0_full=x0)
+    xy_def, _, _, _, U_def, ade_def = run_mpc(speed, gt_xyz, gt_yaw, WEIGHTS_DEFAULT, x0_full=x0)
 
     if has_opt:
-        xy_opt, U_opt, ade_opt = run_mpc(speed, gt_xyz, gt_yaw, w_opt, x0_full=x0)
+        xy_opt, _, _, _, U_opt, ade_opt = run_mpc(speed, gt_xyz, gt_yaw, w_opt, x0_full=x0)
     else:
         xy_opt = U_opt = None
         ade_opt = float("nan")

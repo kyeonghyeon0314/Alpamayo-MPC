@@ -54,7 +54,7 @@ import matplotlib.gridspec as gridspec
 # ══════════════════════════════════════════════════════
 sys.path.insert(0, str(Path(__file__).parent))
 from mpc import (
-    DT, N, NX, NU,
+    DT, N, NX, NU, WB,
     IX, IY, IYAW, IVX, IVY, IYR, ISTEER, IACCEL,
     V_MIN_LIN, QP_REG, W_LAT_FIXED, WEIGHTS_DEFAULT,
     U_MIN, U_MAX,
@@ -172,7 +172,7 @@ def plot_cell(ax, h5_path: Path):
     gt_yaw   = gt_ego[:, 3]
     gt_xy    = gt_xyz[:N, :2]
 
-    xy_opt, _, _ = run_mpc(speed, gt_xyz, gt_yaw, w_opt, x0_full=x0)
+    xy_opt, _, _, _, _, _ = run_mpc(speed, gt_xyz, gt_yaw, w_opt, x0_full=x0)
 
     ax.plot(gt_xy[:, 1],  gt_xy[:, 0],  "g-",  lw=1.5, label="GT")
     ax.plot(xy_opt[:, 1], xy_opt[:, 0], "b--", lw=1.2, label="Opt")
@@ -227,8 +227,15 @@ def plot_sample(ax_traj, ax_ctrl, h5_path):
     gt_xy    = gt_xyz[:N, :2]
     t_axis   = np.arange(1, N+1) * DT
 
-    xy_opt, U_opt, ade_opt = run_mpc(speed, gt_xyz, gt_yaw, w_opt,          x0_full=x0)
-    xy_def, U_def, ade_def = run_mpc(speed, gt_xyz, gt_yaw, WEIGHTS_DEFAULT, x0_full=x0)
+    # GT 제어 신호 역산
+    _yaw_ext_s     = np.unwrap(np.concatenate([[0.], gt_yaw[:N]]))
+    gt_yr_s        = np.gradient(_yaw_ext_s, DT)[1:]
+    gt_vx_s        = np.maximum(gt_ego[:N, 2], V_MIN_LIN)
+    gt_steer_deg_s = np.degrees(np.arctan2(gt_yr_s * WB, gt_vx_s))
+    gt_accel_s     = gt_ego[:N, 4]
+
+    xy_opt, _, steer_opt_s, accel_opt_s, U_opt, ade_opt = run_mpc(speed, gt_xyz, gt_yaw, w_opt,          x0_full=x0)
+    xy_def, _, steer_def_s, accel_def_s, U_def, ade_def = run_mpc(speed, gt_xyz, gt_yaw, WEIGHTS_DEFAULT, x0_full=x0)
 
     sr_opt, jr_opt = _comfort_metrics(U_opt)
     sr_def, jr_def = _comfort_metrics(U_def)
@@ -255,16 +262,18 @@ def plot_sample(ax_traj, ax_ctrl, h5_path):
     ax_traj.legend(fontsize=6, loc="best")
     ax_traj.grid(True, ls=":", lw=0.5)
 
-    ax_ctrl.plot(t_axis, U_opt[:, 0], "b--", lw=1.5, label="steer (opt)")
-    ax_ctrl.plot(t_axis, U_opt[:, 1], "b-",  lw=1.5, label="accel (opt)")
-    ax_ctrl.plot(t_axis, U_def[:, 0], "r:",  lw=1.2, label="steer (def)")
-    ax_ctrl.plot(t_axis, U_def[:, 1], "r-.", lw=1.2, label="accel (def)")
+    ax_ctrl.plot(t_axis, gt_steer_deg_s,                "g-",  lw=2.0, label="steer [deg] (GT)")
+    ax_ctrl.plot(t_axis, gt_accel_s,                    "g--", lw=1.5, label="accel (GT)")
+    ax_ctrl.plot(t_axis, np.degrees(steer_opt_s),       "b--", lw=1.5, label="steer [deg] (opt state)")
+    ax_ctrl.plot(t_axis, accel_opt_s,                   "b-",  lw=1.5, label="accel (opt state)")
+    ax_ctrl.plot(t_axis, np.degrees(steer_def_s),       "r:",  lw=1.2, label="steer [deg] (def state)")
+    ax_ctrl.plot(t_axis, accel_def_s,                   "r-.", lw=1.2, label="accel (def state)")
     ax_ctrl.axhline(0, c="k", lw=0.5, ls="--")
     ax_ctrl.set_xlabel("Time [s]", fontsize=7)
     ax_ctrl.set_ylabel("Cmd",      fontsize=7)
     ax_ctrl.set_title(
-        f"Control  |  opt: SR={sr_opt:.4f}  Jerk={jr_opt:.4f}"
-        f"   def: SR={sr_def:.4f}  Jerk={jr_def:.4f}",
+        f"Control  |  opt: SR={np.degrees(sr_opt):.4f}deg/step  Jerk={jr_opt:.4f}"
+        f"   def: SR={np.degrees(sr_def):.4f}deg/step  Jerk={jr_def:.4f}",
         fontsize=6,
     )
     ax_ctrl.legend(fontsize=6, ncol=2)
@@ -288,8 +297,9 @@ def plot_single(h5_path: Path, out_dir: Path):
         if "labels/mpc_weights" not in f:
             print(f"[WARN] {h5_path.name} has no labels/mpc_weights")
             return
-        w_opt      = f["labels/mpc_weights"][:]
-        ade_stored = float(f["labels/ade"][()])
+        w_opt       = f["labels/mpc_weights"][:]
+        ade_stored  = float(f["labels/ade"][()])
+        ade_yaw_stored = float(f["labels/ade_yaw"][()]) if "labels/ade_yaw" in f else None
 
     speed    = float(hist[-1, 2])
     x0       = compute_x0(speed, hist[-1, 4], hist_vel[-1], hist_curv[-1, 0], hist_quat[-1])
@@ -298,17 +308,29 @@ def plot_single(h5_path: Path, out_dir: Path):
     t_axis   = np.arange(1, N + 1) * DT
     t_diff   = t_axis[:-1]          # N-1 midpoints for diff-based plots
 
-    xy_opt, U_opt, ade_opt = run_mpc(speed, gt_xyz, gt_yaw, w_opt,          x0_full=x0)
-    xy_def, U_def, ade_def = run_mpc(speed, gt_xyz, gt_yaw, WEIGHTS_DEFAULT, x0_full=x0)
+    # ── GT 제어 신호 역산 ─────────────────────────────────────
+    gt_speed_arr   = gt_ego[:, 2]                          # vx [m/s]
+    gt_accel_arr   = gt_ego[:, 4]                          # lon_accel [m/s²]
+    _yaw_ext       = np.unwrap(np.concatenate([[0.], gt_yaw[:N]]))
+    gt_yr          = np.gradient(_yaw_ext, DT)[1:]         # yaw_rate [rad/s]
+    gt_vx          = np.maximum(gt_speed_arr[:N], V_MIN_LIN)
+    gt_steer_deg   = np.degrees(np.arctan2(gt_yr * WB, gt_vx))  # [deg]
+    gt_accel_n     = gt_accel_arr[:N]                      # [m/s²]
+    gt_sr_deg      = np.abs(np.diff(gt_steer_deg))         # steer rate [deg/step]
+    gt_jerk        = np.abs(np.diff(gt_accel_n))           # jerk [m/s²/step]
+
+    xy_opt, yaw_opt, steer_opt, accel_opt, U_opt, ade_opt = run_mpc(speed, gt_xyz, gt_yaw, w_opt,          x0_full=x0)
+    xy_def, yaw_def, steer_def, accel_def, U_def, ade_def = run_mpc(speed, gt_xyz, gt_yaw, WEIGHTS_DEFAULT, x0_full=x0)
 
     sr_opt, jr_opt = _comfort_metrics(U_opt)
     sr_def, jr_def = _comfort_metrics(U_def)
 
     fig = plt.figure(figsize=(15, 11))
+    yaw_stored_str = f"  ADE_yaw={np.degrees(ade_yaw_stored):.4f}deg" if ade_yaw_stored is not None else ""
     fig.suptitle(
-        f"{h5_path.name}   v0={speed:.1f} m/s   stored ADE={ade_stored:.3f}m\n"
-        f"Opt  ADE={ade_opt:.3f}m  SR={sr_opt:.4f}  Jerk={jr_opt:.4f}   |   "
-        f"Def  ADE={ade_def:.3f}m  SR={sr_def:.4f}  Jerk={jr_def:.4f}",
+        f"{h5_path.name}   v0={speed:.1f} m/s   stored ADE_xy={ade_stored:.3f}m{yaw_stored_str}\n"
+        f"Opt  ADE_xy={ade_opt:.3f}m  SR={np.degrees(sr_opt):.4f}deg/step  Jerk={jr_opt:.4f}   |   "
+        f"Def  ADE_xy={ade_def:.3f}m  SR={np.degrees(sr_def):.4f}deg/step  Jerk={jr_def:.4f}",
         fontsize=9,
     )
 
@@ -353,63 +375,94 @@ def plot_single(h5_path: Path, out_dir: Path):
     ax_traj.legend(loc="best", fontsize=8)
     ax_traj.grid(True, ls=":", lw=0.5)
 
-    # ── ADE per-step error (row 0, cols 1-2) ────────────
-    ax_err = fig.add_subplot(gs[0, 1:3])
-    err_opt = np.linalg.norm(xy_opt - gt_xy, axis=1)
-    err_def = np.linalg.norm(xy_def - gt_xy, axis=1)
-    ax_err.plot(t_axis, err_opt, "b--", lw=1.8, label=f"Opt  ADE={err_opt.mean():.3f}m")
-    ax_err.plot(t_axis, err_def, "r:",  lw=1.5, label=f"Def  ADE={err_def.mean():.3f}m")
-    ax_err.set_xlabel("Time [s]")
-    ax_err.set_ylabel("||pred - GT|| [m]")
-    ax_err.set_title("Per-step displacement error  (ADE = mean)")
-    ax_err.legend(fontsize=8)
-    ax_err.grid(True, ls=":", lw=0.5)
-    ax_err.set_ylim(bottom=0)
+    # ── ADE_xy per-step error (row 0, col 1) ────────────
+    ax_err_xy = fig.add_subplot(gs[0, 1])
+    err_xy_opt = np.linalg.norm(xy_opt - gt_xy, axis=1)
+    err_xy_def = np.linalg.norm(xy_def - gt_xy, axis=1)
+    ax_err_xy.plot(t_axis, err_xy_opt, "b--", lw=1.8, label=f"Opt  ADE={err_xy_opt.mean():.3f}m")
+    ax_err_xy.plot(t_axis, err_xy_def, "r:",  lw=1.5, label=f"Def  ADE={err_xy_def.mean():.3f}m")
+    ax_err_xy.set_xlabel("Time [s]")
+    ax_err_xy.set_ylabel("||pred - GT|| [m]")
+    ax_err_xy.set_title("Per-step XY error  (ADE_xy)")
+    ax_err_xy.legend(fontsize=8)
+    ax_err_xy.grid(True, ls=":", lw=0.5)
+    ax_err_xy.set_ylim(bottom=0)
 
-    # ── Steer command (row 1, col 1) ────────────────────
+    # ── ADE_yaw per-step error (row 0, col 2) ───────────
+    ax_err_yaw = fig.add_subplot(gs[0, 2])
+    err_yaw_opt = np.degrees(np.abs(yaw_opt - gt_yaw[:N]))
+    err_yaw_def = np.degrees(np.abs(yaw_def - gt_yaw[:N]))
+    ax_err_yaw.plot(t_axis, err_yaw_opt, "b--", lw=1.8, label=f"Opt  ADE={err_yaw_opt.mean():.4f}deg")
+    ax_err_yaw.plot(t_axis, err_yaw_def, "r:",  lw=1.5, label=f"Def  ADE={err_yaw_def.mean():.4f}deg")
+    ax_err_yaw.set_xlabel("Time [s]")
+    ax_err_yaw.set_ylabel("|yaw_pred - yaw_GT| [deg]")
+    ax_err_yaw.set_title("Per-step yaw error  (ADE_yaw)")
+    ax_err_yaw.legend(fontsize=8)
+    ax_err_yaw.grid(True, ls=":", lw=0.5)
+    ax_err_yaw.set_ylim(bottom=0)
+
+    # ── Steer angle state (row 1, col 1) ────────────────
+    # steer_opt/def: 예측 실제 조향각 state (actuator 출력), U와 다름
     ax_steer = fig.add_subplot(gs[1, 1])
-    ax_steer.plot(t_axis, U_opt[:, 0], "b--", lw=1.8, label="opt")
-    ax_steer.plot(t_axis, U_def[:, 0], "r:",  lw=1.5, label="def")
+    ax_steer.plot(t_axis, gt_steer_deg,               "g-",  lw=2.0, label="GT (actual)")
+    ax_steer.plot(t_axis, np.degrees(steer_opt),      "b--", lw=1.8, label="opt (state)")
+    ax_steer.plot(t_axis, np.degrees(steer_def),      "r:",  lw=1.5, label="def (state)")
+    ax_steer.plot(t_axis, np.degrees(U_opt[:, 0]),    "b-",  lw=0.8, alpha=0.4, label="opt (cmd)")
+    ax_steer.plot(t_axis, np.degrees(U_def[:, 0]),    "r-",  lw=0.8, alpha=0.4, label="def (cmd)")
     ax_steer.axhline(0, c="k", lw=0.5, ls="--")
     ax_steer.set_xlabel("Time [s]")
-    ax_steer.set_ylabel("Steering [rad]")
-    ax_steer.set_title("Steering command")
+    ax_steer.set_ylabel("Steering [deg]")
+    ax_steer.set_title("Steering angle  (state vs cmd)")
     ax_steer.legend(fontsize=7)
     ax_steer.grid(True, ls=":", lw=0.5)
 
-    # ── Accel command (row 1, col 2) ────────────────────
+    # ── Accel state (row 1, col 2) ──────────────────────
     ax_accel = fig.add_subplot(gs[1, 2])
-    ax_accel.plot(t_axis, U_opt[:, 1], "b--", lw=1.8, label="opt")
-    ax_accel.plot(t_axis, U_def[:, 1], "r:",  lw=1.5, label="def")
+    ax_accel.plot(t_axis, gt_accel_n,   "g-",  lw=2.0, label="GT (actual)")
+    ax_accel.plot(t_axis, accel_opt,    "b--", lw=1.8, label="opt (state)")
+    ax_accel.plot(t_axis, accel_def,    "r:",  lw=1.5, label="def (state)")
+    ax_accel.plot(t_axis, U_opt[:, 1],  "b-",  lw=0.8, alpha=0.4, label="opt (cmd)")
+    ax_accel.plot(t_axis, U_def[:, 1],  "r-",  lw=0.8, alpha=0.4, label="def (cmd)")
     ax_accel.axhline(0, c="k", lw=0.5, ls="--")
     ax_accel.set_xlabel("Time [s]")
     ax_accel.set_ylabel("Accel [m/s²]")
-    ax_accel.set_title("Acceleration command")
+    ax_accel.set_title("Acceleration  (state vs cmd)")
     ax_accel.legend(fontsize=7)
     ax_accel.grid(True, ls=":", lw=0.5)
 
     # ── Steer rate |Δsteer| (row 2, col 1) ──────────────
+    # state 기반 변화율 (GT와 같은 물리량)
     ax_sr = fig.add_subplot(gs[2, 1])
-    ax_sr.plot(t_diff, np.abs(np.diff(U_opt[:, 0])), "b--", lw=1.8,
-               label=f"opt  rms={sr_opt:.4f}")
-    ax_sr.plot(t_diff, np.abs(np.diff(U_def[:, 0])), "r:",  lw=1.5,
-               label=f"def  rms={sr_def:.4f}")
+    sr_opt_state = np.abs(np.diff(np.degrees(steer_opt)))
+    sr_def_state = np.abs(np.diff(np.degrees(steer_def)))
+    gt_sr_rms_deg = float(np.sqrt(np.mean(gt_sr_deg ** 2)))
+    ax_sr.plot(t_diff, gt_sr_deg,    "g-",  lw=2.0,
+               label=f"GT   rms={gt_sr_rms_deg:.4f}")
+    ax_sr.plot(t_diff, sr_opt_state, "b--", lw=1.8,
+               label=f"opt  rms={float(np.sqrt(np.mean(sr_opt_state**2))):.4f}")
+    ax_sr.plot(t_diff, sr_def_state, "r:",  lw=1.5,
+               label=f"def  rms={float(np.sqrt(np.mean(sr_def_state**2))):.4f}")
     ax_sr.set_xlabel("Time [s]")
-    ax_sr.set_ylabel("|Δsteer| [rad/step]")
-    ax_sr.set_title("Steering rate  |Δsteer|")
+    ax_sr.set_ylabel("|Δsteer state| [deg/step]")
+    ax_sr.set_title("Steering rate  |Δsteer state|")
     ax_sr.legend(fontsize=7)
     ax_sr.grid(True, ls=":", lw=0.5)
     ax_sr.set_ylim(bottom=0)
 
-    # ── Jerk |Δaccel| (row 2, col 2) ────────────────────
+    # ── Jerk |Δaccel state| (row 2, col 2) ──────────────
     ax_jerk = fig.add_subplot(gs[2, 2])
-    ax_jerk.plot(t_diff, np.abs(np.diff(U_opt[:, 1])), "b--", lw=1.8,
-                 label=f"opt  rms={jr_opt:.4f}")
-    ax_jerk.plot(t_diff, np.abs(np.diff(U_def[:, 1])), "r:",  lw=1.5,
-                 label=f"def  rms={jr_def:.4f}")
+    jerk_opt_state = np.abs(np.diff(accel_opt))
+    jerk_def_state = np.abs(np.diff(accel_def))
+    gt_jr_rms = float(np.sqrt(np.mean(gt_jerk ** 2)))
+    ax_jerk.plot(t_diff, gt_jerk,        "g-",  lw=2.0,
+                 label=f"GT   rms={gt_jr_rms:.4f}")
+    ax_jerk.plot(t_diff, jerk_opt_state, "b--", lw=1.8,
+                 label=f"opt  rms={float(np.sqrt(np.mean(jerk_opt_state**2))):.4f}")
+    ax_jerk.plot(t_diff, jerk_def_state, "r:",  lw=1.5,
+                 label=f"def  rms={float(np.sqrt(np.mean(jerk_def_state**2))):.4f}")
     ax_jerk.set_xlabel("Time [s]")
-    ax_jerk.set_ylabel("|Δaccel| [(m/s²)/step]")
-    ax_jerk.set_title("Jerk  |Δaccel|")
+    ax_jerk.set_ylabel("|Δaccel state| [(m/s²)/step]")
+    ax_jerk.set_title("Jerk  |Δaccel state|")
     ax_jerk.legend(fontsize=7)
     ax_jerk.grid(True, ls=":", lw=0.5)
     ax_jerk.set_ylim(bottom=0)

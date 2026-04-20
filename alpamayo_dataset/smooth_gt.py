@@ -38,8 +38,9 @@ logging.basicConfig(
 # ══════════════════════════════════════════════════════
 # Paths  ← edit as needed
 # ══════════════════════════════════════════════════════
-DATA_DIR = "./alpamayo_dataset/data/prepare/train"
-VIZ_DIR  = "./alpamayo_dataset/data/smooth_viz"
+DATA_DIR      = "./alpamayo_dataset/data/prepare"
+VIZ_DIR       = "./data/smooth_viz"
+DEFAULT_SPLITS = ["train", "val", "test"]
 
 # ══════════════════════════════════════════════════════
 # Smoothing defaults
@@ -271,7 +272,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--data-dir",   default=DATA_DIR,
-                        help="Directory containing .h5 files")
+                        help="prepare/ 베이스 디렉토리 (하위 splits를 자동 탐색)")
+    parser.add_argument("--splits",     nargs="+", default=DEFAULT_SPLITS,
+                        metavar="SPLIT",
+                        help="처리할 split 이름 (default: train val). test는 포함하지 말 것")
     parser.add_argument("--viz-dir",    default=VIZ_DIR,
                         help="Output directory for visualization PNGs")
     parser.add_argument("--lambda-xy",  type=float, default=DEFAULT_LAMBDA_XY,
@@ -292,12 +296,21 @@ def main() -> None:
                         help="Process only 10 random files for quick check")
     args = parser.parse_args()
 
-    data_dir = Path(args.data_dir)
+    base_dir = Path(args.data_dir)
     viz_dir  = Path(args.viz_dir)
 
-    h5_files = sorted(data_dir.glob("*.h5"))
+    h5_files: list[Path] = []
+    for split in args.splits:
+        split_dir = base_dir / split
+        if not split_dir.exists():
+            logging.warning("split 디렉토리 없음, 건너뜀: %s", split_dir)
+            continue
+        found = sorted(split_dir.glob("*.h5"))
+        logging.info("split=%s: %d개 파일", split, len(found))
+        h5_files.extend(found)
+
     if not h5_files:
-        logging.error("No .h5 files found in: %s", data_dir)
+        logging.error("처리할 .h5 파일 없음 (base=%s, splits=%s)", base_dir, args.splits)
         return
 
     if args.dry_run:
@@ -309,8 +322,8 @@ def main() -> None:
     inv_A_yaw = _make_inv_A(N_FUTURE, args.lambda_yaw)
 
     logging.info(
-        "Files: %d | λ_xy=%.3f | λ_yaw=%.3f | workers=%d | overwrite=%s",
-        len(h5_files), args.lambda_xy, args.lambda_yaw, args.workers, args.overwrite,
+        "총 파일: %d | splits=%s | λ_xy=%.3f | λ_yaw=%.3f | workers=%d | overwrite=%s",
+        len(h5_files), args.splits, args.lambda_xy, args.lambda_yaw, args.workers, args.overwrite,
     )
 
     tasks = [(p, args.lambda_xy, args.lambda_yaw) for p in h5_files]

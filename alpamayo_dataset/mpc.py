@@ -170,6 +170,48 @@ def _build_prediction_matrices(
     return S_x, S_u
 
 
+def _build_prediction_matrices_tv(
+    A_list: list[np.ndarray],
+    B_list: list[np.ndarray],
+) -> tuple[np.ndarray, np.ndarray]:
+    """LTV Condensed prediction matrices (step-wise linearization).
+
+    각 스텝 k에서 A_list[k], B_list[k]로 선형화된 예측 행렬 구성:
+      x_{k+1} = A_list[k] @ x_k + B_list[k] @ u_k
+
+    S_x[k] = Φ(k,0) = A[k-1]·…·A[0]
+    S_u[k,j] = Φ(k, j+1) @ B[j]  (k > j, else 0)
+
+    Args:
+        A_list: 길이 n, 각 원소 (NX, NX)
+        B_list: 길이 n, 각 원소 (NX, NU)
+
+    Returns:
+        S_x: ((n+1)·NX, NX)
+        S_u: ((n+1)·NX, n·NU)
+    """
+    n = len(A_list)
+    S_x = np.zeros(((n + 1) * NX, NX))
+    S_u = np.zeros(((n + 1) * NX, n * NU))
+
+    # S_x: cumulative state transition Φ(k, 0)
+    Phi = np.eye(NX)
+    S_x[:NX] = Phi
+    for k in range(n):
+        Phi = A_list[k] @ Phi
+        S_x[(k + 1) * NX:(k + 2) * NX] = Phi
+
+    # S_u: forced response  S_u[k+1, j] = A[k]·…·A[j+1] @ B[j]
+    for j in range(n):
+        Psi = B_list[j].copy()                                          # Φ(j+1,j+1)@B[j] = B[j]
+        S_u[(j + 1) * NX:(j + 2) * NX, j * NU:(j + 1) * NU] = Psi
+        for k in range(j + 1, n):
+            Psi = A_list[k] @ Psi                                       # Φ(k+1,j+1)@B[j]
+            S_u[(k + 1) * NX:(k + 2) * NX, j * NU:(j + 1) * NU] = Psi
+
+    return S_x, S_u
+
+
 def step_dynamics(x: np.ndarray, u: np.ndarray) -> np.ndarray:
     """단일 DT 스텝 선형 동역학 적분 (ZOH).
 
@@ -271,7 +313,12 @@ def run_mpc(
                   pseudo-closed-loop에서 velocity/actuator 상태를 이어받을 때 사용.
 
     Returns:
-        xy_pred (n, 2), U_opt (n, 2), ade [m]
+        xy_pred    (n, 2)  예측 xy 궤적 [m]
+        yaw_pred   (n,)    예측 yaw [rad]
+        steer_pred (n,)    예측 실제 조향각 [rad]  (actuator state, U[:,0]이 아님)
+        accel_pred (n,)    예측 실제 가속도 [m/s²] (actuator state, U[:,1]이 아님)
+        U_opt      (n, 2)  최적 제어 입력 (steering_cmd, accel_cmd)
+        ade        float   xy ADE [m]
     """
     NNU = n * NU
     if x0_full is not None:
@@ -306,7 +353,11 @@ def run_mpc(
     ub = np.tile(U_MAX, n)
     U_opt = _solve_qp(H, g, lb, ub)
 
-    X_pred  = x_free + S_u @ U_opt
-    xy_pred = X_pred[NX:].reshape(n, NX)[:, [IX, IY]]
-    ade     = float(np.mean(np.linalg.norm(xy_pred - gt_xyz[:n, :2], axis=1)))
-    return xy_pred, U_opt.reshape(n, NU), ade
+    X_pred     = x_free + S_u @ U_opt
+    states     = X_pred[NX:].reshape(n, NX)
+    xy_pred    = states[:, [IX, IY]]
+    yaw_pred   = states[:, IYAW]
+    steer_pred = states[:, ISTEER]
+    accel_pred = states[:, IACCEL]
+    ade        = float(np.mean(np.linalg.norm(xy_pred - gt_xyz[:n, :2], axis=1)))
+    return xy_pred, yaw_pred, steer_pred, accel_pred, U_opt.reshape(n, NU), ade

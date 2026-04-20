@@ -69,10 +69,10 @@ logging.basicConfig(
 
 sys.path.insert(0, str(Path(__file__).parent))
 from mpc import (
-    N, N_LABEL, N_EVAL, NX, NU,
-    IX, IY, IYAW,
+    N, N_LABEL, N_EVAL, NX, NU, DT,
+    IX, IY, IYAW, IVX, IVY, IYR, ISTEER, IACCEL, WB,
     V_MIN_LIN, QP_REG, U_MIN, U_MAX, W_LAT_FIXED, TERMINAL_Q_FACTOR,
-    _linearize, _build_prediction_matrices, _solve_qp, _build_delta_matrix,
+    _linearize, _build_prediction_matrices_tv, _solve_qp, _build_delta_matrix,
     compute_x0,
 )
 
@@ -109,6 +109,74 @@ W_ADE_PENALTY: float = 1.0
 W_YAW_ADE:     float = 2.0   # yaw 오차 가중치 [rad → m 등가 스케일]
 
 # ══════════════════════════════════════════════════════
+# GT 명목 상태 복원 (LTV 선형화용)
+# ══════════════════════════════════════════════════════
+
+def _build_gt_full_states(
+    x0:           np.ndarray,
+    gt_xy:        np.ndarray,
+    gt_yaw:       np.ndarray,
+    gt_speed:     np.ndarray,
+    gt_lon_accel: np.ndarray,
+) -> list[np.ndarray]:
+    """GT smooth 궤적에서 LTV 선형화용 명목 상태 복원.
+
+    Args:
+        x0:           (NX,)         t0 초기 상태 — compute_x0() 결과
+        gt_xy:        (≥N_LABEL, 2) smooth 미래 xy [m]  (로컬 프레임)
+        gt_yaw:       (≥N_LABEL,)   smooth 미래 yaw [rad]
+        gt_speed:     (≥N_LABEL,)   종방향 속도 [m/s]  (gt/future_ego_states[:,2])
+        gt_lon_accel: (≥N_LABEL,)   종방향 가속도 [m/s²] (gt/future_ego_states[:,4])
+
+    Returns:
+        states: list of (NX,) arrays, length N_LABEL
+          states[0] = x0  (정확한 t0 초기 상태)
+          states[k] (k≥1): t0+k*DT 시점의 NX=8 상태 추정값
+            [x, y, yaw, vx, vy, yaw_rate, steering, lon_accel]
+    """
+    # ── t0를 포함한 연장 배열 구성 (인덱스 0=t0, 1..N_LABEL=GT) ──
+    xy_ext    = np.vstack([[0., 0.], gt_xy[:N_LABEL].astype(np.float64)])          # (N_LABEL+1, 2)
+    yaw_uw    = np.unwrap(
+        np.concatenate([[0.], gt_yaw[:N_LABEL].astype(np.float64)])
+    )                                                                               # (N_LABEL+1,)
+    speed_ext = np.concatenate(
+        [[float(x0[IVX])], gt_speed[:N_LABEL].astype(np.float64)]
+    )                                                                               # (N_LABEL+1,)
+    accel_ext = np.concatenate(
+        [[float(x0[IACCEL])], gt_lon_accel[:N_LABEL].astype(np.float64)]
+    )                                                                               # (N_LABEL+1,)
+
+    # ── yaw_rate: unwrapped yaw의 중앙 차분 ──
+    yr_ext = np.gradient(yaw_uw, DT)   # (N_LABEL+1,)
+
+    # ── local-frame 속도: 위치 중앙 차분 → body frame 변환으로 vy 추정 ──
+    vl_x = np.gradient(xy_ext[:, 0], DT)  # (N_LABEL+1,)
+    vl_y = np.gradient(xy_ext[:, 1], DT)  # (N_LABEL+1,)
+
+    states: list[np.ndarray] = []
+    for k in range(N_LABEL):
+        if k == 0:
+            # t0: compute_x0() 결과 그대로 사용 (가장 정확)
+            states.append(x0)
+            continue
+
+        yaw_k   = float(yaw_uw[k])
+        cy, sy  = np.cos(yaw_k), np.sin(yaw_k)
+        vx_k    = max(float(speed_ext[k]), V_MIN_LIN)
+        # R(-yaw) @ v_local → body-frame vy
+        vy_k    = float(-sy * vl_x[k] + cy * vl_y[k])
+        yr_k    = float(yr_ext[k])
+        steer_k = float(np.arctan2(yr_k * WB, vx_k))
+
+        states.append(np.array([
+            xy_ext[k, 0], xy_ext[k, 1], yaw_k,
+            vx_k, vy_k, yr_k, steer_k, float(accel_ext[k]),
+        ]))
+
+    return states  # length N_LABEL
+
+
+# ══════════════════════════════════════════════════════
 # 핵심 클래스: 샘플별 MPC Labeler
 # ══════════════════════════════════════════════════════
 
@@ -116,32 +184,39 @@ class MPCLabeler:
     """
     단일 샘플에 대한 MPC 가중치 역산기.
 
-    x0에서 한 번 선형화 후 S_x, S_u를 캐시 →
-    Nelder-Mead 반복마다 QP만 재풀이 (open-loop 근사).
+    GT 궤적 각 스텝에서 선형화(LTV) → S_x, S_u를 __init__에서 1회 구성 →
+    L-BFGS-B 반복마다 QP만 재풀이 (pseudo-closed-loop).
 
     솔버 호라이즌: N_LABEL=N=20 (배포와 동일)
     ADE 평가 구간: N_EVAL=15 (1.5s, 터미널 롤오프 5스텝 제외)
     R 페널티: Δu 기반 (D.T @ R_blk @ D) — 터미널 수렴 구조적 억제
 
-    Open-loop 근사의 의미:
-      - GT 궤적은 물리적으로 달성 가능한 궤적
-      - 단일 linearization → 동역학이 크게 변하지 않는 3초 이내는 충분히 정확
-      - 가중치 역산 목적에서 closed-loop과의 오차는 허용 범위 내
+    Pseudo-closed-loop 의미:
+      - GT smooth 궤적을 명목 궤적으로 사용 → 각 스텝 k마다 A_d[k], B_d[k] 선형화
+      - 코너/가속 구간에서 yaw·vx 변화에 따른 시변 dynamics 정확 반영
+      - S_x, S_u는 __init__에서 고정 → 가중치 최적화 루프 구조 동일 (QP만 반복)
     """
 
-    def __init__(self, x0: np.ndarray, gt_xy: np.ndarray, gt_yaw: np.ndarray):
+    def __init__(
+        self,
+        x0:           np.ndarray,
+        gt_xy:        np.ndarray,
+        gt_yaw:       np.ndarray,
+        gt_speed:     np.ndarray,
+        gt_lon_accel: np.ndarray,
+    ):
         """
         Args:
-            x0:      (NX=8,) MPC 초기 상태 — compute_x0()로 생성
-                     [x=0, y=0, yaw=0, vx, vy, yaw_rate, steering, lon_accel]
-            gt_xy:   (≥N_LABEL, 2)  GT 미래 x, y (로컬 프레임, t0+0.1s부터)
-                     smooth_gt.py 실행 후 h5의 gt_smooth/future_xy 사용 권장
-            gt_yaw:  (≥N_LABEL,)    GT 미래 yaw [rad]
-                     smooth_gt.py 실행 후 h5의 gt_smooth/future_yaw 사용 권장
+            x0:           (NX=8,)       MPC 초기 상태 — compute_x0()로 생성
+            gt_xy:        (≥N_LABEL, 2) GT smooth 미래 xy (로컬 프레임)
+            gt_yaw:       (≥N_LABEL,)   GT smooth 미래 yaw [rad]
+            gt_speed:     (≥N_LABEL,)   GT 종방향 속도 [m/s]  (future_ego_states[:,2])
+            gt_lon_accel: (≥N_LABEL,)   GT 종방향 가속도 [m/s²] (future_ego_states[:,4])
         """
-
-        A_d, B_d = _linearize(x0)
-        self.S_x, self.S_u = _build_prediction_matrices(A_d, B_d, n=N_LABEL)
+        # ── LTV: GT 궤적 각 스텝에서 선형화 ────────────────────────────
+        nom_states      = _build_gt_full_states(x0, gt_xy, gt_yaw, gt_speed, gt_lon_accel)
+        A_list, B_list  = zip(*[_linearize(s) for s in nom_states])
+        self.S_x, self.S_u = _build_prediction_matrices_tv(list(A_list), list(B_list))
 
         # 자유 응답 (제어 입력 = 0일 때의 상태 궤적)
         self._x_free = self.S_x @ x0   # ((N_LABEL+1)·NX,)
@@ -271,6 +346,25 @@ class MPCLabeler:
         X_pred  = self._x_free + self.S_u @ U_opt
         xy_pred = X_pred[NX:].reshape(N_LABEL, NX)[:N_EVAL, [IX, IY]]
         return float(np.mean(np.linalg.norm(xy_pred - self._gt_xy, axis=1)))
+
+    def _compute_ade_yaw(self, theta: np.ndarray) -> float:
+        """yaw-only ADE [rad] — h5 저장 전용."""
+        w = np.exp(np.clip(theta, -10., 10.))
+
+        H = (self._H_lat
+           + w[0] * self._H_Q_basis[0]
+           + w[1] * self._H_Q_basis[2])
+        H += w[2] * self._R_basis[0] + w[3] * self._R_basis[1]
+        H  = 0.5 * (H + H.T) + QP_REG * np.eye(N_LABEL * NU)
+
+        g = (self._g_lat
+           + w[0] * self._g_Q_basis[0]
+           + w[1] * self._g_Q_basis[2])
+
+        U_opt    = _solve_qp(H, g, self._lb, self._ub)
+        X_pred   = self._x_free + self.S_u @ U_opt
+        yaw_pred = X_pred[NX:].reshape(N_LABEL, NX)[:N_EVAL, IYAW]
+        return float(np.mean(np.abs(yaw_pred - self._gt_yaw)))
 
     # ── Value + Analytical Gradient ──────────────────────
 
@@ -409,13 +503,15 @@ class MPCLabeler:
             w_opt[0], W_LAT_FIXED, w_opt[1], w_opt[2], w_opt[3],
         ], dtype=np.float32)
 
-        # h5 저장·필터링용 지표 (reg 제외)
-        ade_xy  = self._compute_ade_xy(res.x)           # xy-only [m]
+        # h5 저장·필터링용 지표 (reg 제외, QP 재풀이 3회)
+        ade_xy  = self._compute_ade_xy(res.x)            # xy ADE [m]  — threshold 필터링 기준
+        ade_yaw = self._compute_ade_yaw(res.x)           # yaw ADE [rad] — 시각화용
         steer_rate_rms, jerk_rms = self._compute_comfort_metrics(res.x)
 
         return {
             "weights":        weights,
             "ade":            ade_xy,             # xy ADE [m] — threshold 필터링 기준
+            "ade_yaw":        ade_yaw,            # yaw ADE [rad] — 시각화용
             "objective":      float(res.fun),     # 최적화 목적함수 값 (ADE_xy+W_YAW*ADE_yaw+reg)
             "success":        bool(res.success),
             "n_evals":        int(res.nfev),
@@ -475,30 +571,35 @@ def _label_one(args: tuple) -> dict:
             hist_curv = f["input/ego_history_curv"][:]         # (16, 1)
             hist_quat = f["input/ego_history_quat_global"][:]  # (16, 4) [qx,qy,qz,qw]
 
+            # LTV 선형화에 필요한 속도·가속도 (gt_smooth 여부와 무관하게 항상 로드)
+            gt_ego_raw   = f["gt/future_ego_states"][:]        # (64, 5)
+            gt_speed     = gt_ego_raw[:, 2]                    # 종방향 속도 [m/s]
+            gt_lon_accel = gt_ego_raw[:, 4]                    # 종방향 가속도 [m/s²]
+
             # GT 소스: gt_smooth/ 우선, 없으면 raw gt/ 폴백
             if "gt_smooth" in f:
                 gt_xy  = f["gt_smooth/future_xy"][:]           # (64, 2)
                 gt_yaw = f["gt_smooth/future_yaw"][:]          # (64,)
             else:
                 gt_xyz = f["gt/future_xyz"][:]                 # (64, 3)
-                gt_ego = f["gt/future_ego_states"][:]          # (64, 5)
                 gt_xy  = gt_xyz[:, :2]
-                gt_yaw = gt_ego[:, 3]
+                gt_yaw = gt_ego_raw[:, 3]
 
         # t0 초기 상태 복원
         x0      = compute_x0(hist[-1, 2], hist[-1, 4], hist_vel[-1], hist_curv[-1, 0], hist_quat[-1])
-        labeler = MPCLabeler(x0, gt_xy, gt_yaw)
+        labeler = MPCLabeler(x0, gt_xy, gt_yaw, gt_speed, gt_lon_accel)
         opt     = labeler.optimize(max_iter=max_iter)
 
         # h5에 결과 저장
         with h5py.File(h5_path, "a") as f:
             grp = f.require_group("labels")
-            for key in ["mpc_weights", "ade", "valid", "n_evals",
+            for key in ["mpc_weights", "ade", "ade_yaw", "valid", "n_evals",
                         "steer_rate_rms", "jerk_rms"]:
                 if key in grp:
                     del grp[key]
             grp.create_dataset("mpc_weights",    data=opt["weights"])
             grp.create_dataset("ade",            data=np.float32(opt["ade"]))
+            grp.create_dataset("ade_yaw",        data=np.float32(opt["ade_yaw"]))
             grp.create_dataset("valid",          data=bool(opt["ade"] < ade_threshold))
             grp.create_dataset("n_evals",        data=np.int32(opt["n_evals"]))
             grp.create_dataset("steer_rate_rms", data=np.float32(opt["steer_rate_rms"]))
@@ -539,28 +640,30 @@ def main():
     )
     parser.add_argument(
         "--data-dir", required=True,
-        help="수집된 .h5 파일 디렉토리",
+        help="prepare/ 베이스 디렉토리 (하위 splits를 자동 탐색)",
     )
-    parser.add_argument("--workers",         type=int,   default=4,   help="병렬 프로세스 수 (default: 4)")
+    parser.add_argument("--splits",         nargs="+", default=["train", "val", "test"],
+                        metavar="SPLIT",    help="처리할 split (default: train val test)")
+    parser.add_argument("--workers",        type=int,   default=8,   help="병렬 프로세스 수 (default: 4)")
     parser.add_argument("--ade-threshold",  type=float, default=0.5, help="필터링 임계값 [m] (default: 0.5)")
     parser.add_argument("--max-iter",       type=int,   default=500, help="L-BFGS-B / Nelder-Mead 최대 반복 (default: 500)")
     parser.add_argument("--overwrite",      action="store_true",     help="기존 labels/ 덮어쓰기")
     parser.add_argument("--dry-run",        action="store_true",     help="랜덤 샘플 N개만 처리 (페널티 튜닝 확인용)")
     parser.add_argument("--dry-run-n",      type=int,   default=100, help="dry-run 샘플 수 (default: 100)")
     parser.add_argument("--seed",           type=int,   default=None, help="랜덤 시드 (dry-run 시나리오 비교용)")
-    parser.add_argument("--w-ade-penalty", type=float, default=1.0,
+    parser.add_argument("--w-ade-penalty",  type=float, default=1.0,
                         help="ADE 전체 스케일 가중치 (default: 1.0)")
-    parser.add_argument("--w-yaw-ade",    type=float, default=2.0,
+    parser.add_argument("--w-yaw-ade",      type=float, default=2.0,
                         help="yaw ADE 가중치 [rad → m 등가] (default: 2.0, 0=xy-only)")
-    parser.add_argument("--reg-lambda",   type=float, default=0.0,
+    parser.add_argument("--reg-lambda",     type=float, default=0.0,
                         help="Tikhonov 정규화 강도 λ (default: 0.0)")
-    parser.add_argument("--viz-n",        type=int,   default=6,
+    parser.add_argument("--viz-n",          type=int,   default=6,
                         help="레이블링 후 시각화할 랜덤 샘플 수 (default: 6, 0=생략)")
-    parser.add_argument("--viz-dir",      type=str,   default=None,
+    parser.add_argument("--viz-dir",        type=str,   default=None,
                         help="시각화 PNG 저장 경로 (default: --data-dir/viz)")
     args = parser.parse_args()
 
-    data_dir = Path(args.data_dir)
+    base_dir = Path(args.data_dir)
 
     # ── objective 가중치 설정 (main 프로세스용) ──────────────────
     global W_ADE_PENALTY, W_YAW_ADE, _REG_LAMBDA
@@ -572,34 +675,57 @@ def main():
         W_ADE_PENALTY, W_YAW_ADE, _REG_LAMBDA,
     )
 
+    # ── split별 파일 수집 + 인덱스 기반 사전 필터링 ──────────────
+    # labeled_sets: split_dir → 기완료 파일명 집합 (인덱스 업데이트에 재사용)
+    h5_files:    list[Path]          = []
+    split_dirs:  list[Path]          = []
+    labeled_sets: dict[Path, set[str]] = {}
+
+    for split in args.splits:
+        split_dir = base_dir / split
+        if not split_dir.exists():
+            logging.warning("split 디렉토리 없음, 건너뜀: %s", split_dir)
+            continue
+        split_files = sorted(split_dir.glob("*.h5"))
+        logging.info("split=%s: %d개 파일", split, len(split_files))
+
+        if not args.dry_run:
+            lset = _load_index(split_dir)
+            labeled_sets[split_dir] = lset
+            if not args.overwrite and lset:
+                before = len(split_files)
+                split_files = [f for f in split_files if f.name not in lset]
+                logging.info(
+                    "  인덱스: %d개 기완료 → %d개 처리 대상",
+                    before - len(split_files), len(split_files),
+                )
+        else:
+            labeled_sets[split_dir] = set()
+
+        split_dirs.append(split_dir)
+        h5_files.extend(split_files)
+
+    if not h5_files and not args.dry_run:
+        logging.error("처리할 .h5 파일 없음 (base=%s, splits=%s)", base_dir, args.splits)
+        return
+
     if args.dry_run:
-        # 전체 파일 목록 수집 후 무작위 셔플 → 앞 N개 선택
-        all_files = list(data_dir.glob("*.h5"))
+        # dry-run: 전체 목록에서 무작위 N개 선택 (인덱스 무시)
+        all_files: list[Path] = []
+        for split_dir in split_dirs if split_dirs else [base_dir / s for s in args.splits]:
+            all_files.extend(sorted(split_dir.glob("*.h5")))
         rng = random.Random(args.seed)
         rng.shuffle(all_files)
         h5_files = all_files[: args.dry_run_n]
-        labeled_set: set[str] = set()
         logging.info(
             "dry-run 모드: 전체 %d개 중 무작위 %d개 처리 (seed=%s, 인덱스 스킵)",
             len(all_files), len(h5_files),
             args.seed if args.seed is not None else "None",
         )
-    else:
-        h5_files = sorted(data_dir.glob("*.h5"))
-
-        # 인덱스 기반 사전 필터링 (h5 오픈 없이 기완료 파일 스킵)
-        labeled_set = _load_index(data_dir)
-        if not args.overwrite and labeled_set:
-            before = len(h5_files)
-            h5_files = [f for f in h5_files if f.name not in labeled_set]
-            logging.info(
-                "인덱스 (%s): %d개 기완료 → %d개 처리 대상",
-                _INDEX_FILE, before - len(h5_files), len(h5_files),
-            )
 
     logging.info(
-        "처리 대상: %d 파일 | workers=%d | ade_threshold=%.2f m",
-        len(h5_files), args.workers, args.ade_threshold,
+        "처리 대상: %d 파일 | splits=%s | workers=%d | ade_threshold=%.2f m",
+        len(h5_files), args.splits, args.workers, args.ade_threshold,
     )
 
     tasks = [
@@ -689,17 +815,24 @@ def main():
         for r in by_status["error"][:10]:
             logging.warning("  %s — %s", Path(r["path"]).name, r.get("error", "?"))
 
-    # ── 인덱스 업데이트 (dry-run 제외) ─────────────────
+    # ── 인덱스 업데이트 (dry-run 제외, split별로 저장) ─────────────
     if not args.dry_run:
-        newly_done = {Path(r["path"]).name
-                      for r in results if r["status"] in ("ok", "filtered")}
-        updated = newly_done | (labeled_set if not args.overwrite else set())
-        _save_index(data_dir, updated)
-        logging.info("인덱스 업데이트: %d개 → %s", len(updated), data_dir / _INDEX_FILE)
+        for split_dir in split_dirs:
+            newly_done = {
+                Path(r["path"]).name
+                for r in results
+                if r["status"] in ("ok", "filtered")
+                and Path(r["path"]).parent == split_dir
+            }
+            prev = labeled_sets.get(split_dir, set())
+            updated = newly_done | (prev if not args.overwrite else set())
+            _save_index(split_dir, updated)
+            logging.info("인덱스 업데이트 [%s]: %d개 → %s",
+                         split_dir.name, len(updated), split_dir / _INDEX_FILE)
 
     # ── 시각화 (성공 샘플 랜덤 N개) ────────────────────
     if args.viz_n > 0:
-        viz_dir = Path(args.viz_dir) if args.viz_dir else data_dir / "viz"
+        viz_dir = Path(args.viz_dir) if args.viz_dir else base_dir / "label_viz"
         _save_label_viz(
             ok_paths=[Path(r["path"]) for r in by_status["ok"]],
             viz_dir=viz_dir,

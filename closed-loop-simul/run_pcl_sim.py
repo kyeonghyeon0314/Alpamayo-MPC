@@ -233,8 +233,8 @@ def run_pcl_simulation(
 
         # ⑤ MPC 풀기 (MLP / Default)
         #    x0_full 제공 시 run_mpc 내부에서 position/heading을 0으로 정규화
-        _, U_mlp, _ = run_mpc(v0_i, gt_sim_m, gt_yaw_sim_m, w_mlp,        x0_full=x_mlp_l)
-        _, U_def, _ = run_mpc(v0_i, gt_sim_d, gt_yaw_sim_d, WEIGHTS_DEFAULT, x0_full=x_def_l)
+        _, _, _, _, U_mlp, _ = run_mpc(v0_i, gt_sim_m, gt_yaw_sim_m, w_mlp,        x0_full=x_mlp_l)
+        _, _, _, _, U_def, _ = run_mpc(v0_i, gt_sim_d, gt_yaw_sim_d, WEIGHTS_DEFAULT, x0_full=x_def_l)
 
         u_mlp = U_mlp[0]   # Receding Horizon: 첫 번째 입력만 적용
         u_def = U_def[0]
