@@ -17,11 +17,14 @@ STEP 3: cotend → MPC weights MLP 학습
   - 스케줄러:   CosineAnnealingLR (T_max=epochs, eta_min=1e-5)
   - 조기종료:   val loss 기준 patience=30 epoch
 
-데이터 디렉토리 구조 (split_dataset.py 로 사전 생성):
-    split-dir/
-        train/  *.h5  (70%)
-        val/    *.h5  (20%)
-        test/   *.h5  (10%)
+데이터 디렉토리 구조 (label_mpc_weights.py 로 사전 생성):
+    data/prepare/
+        train/  *.h5
+        val/    *.h5
+        test/   *.h5
+        _mlp_cache_train.npz  ← 자동 생성 캐시
+        _mlp_cache_val.npz
+        _mlp_cache_test.npz
 
 출력 파일:
     <out>/best_model.pt        val loss 최소 체크포인트 (가중치만)
@@ -35,8 +38,8 @@ STEP 3: cotend → MPC weights MLP 학습
 
 실행 예시:
     python alpamayo_dataset/train.py \\
-        --split-dir alpamayo_dataset/data/split \\
-        --out       alpamayo_dataset/mlp_out \\
+        --data-dir alpamayo_dataset/data/prepare \\
+        --out      alpamayo_dataset/mlp_out \\
         --balance --lat-thresh 1.0
 """
 
@@ -65,9 +68,11 @@ from model import CotendMLP, PREDICT_IDX, W_NAMES, N_OUT, LOG_MIN, LOG_MAX
 # ══════════════════════════════════════════════════════
 
 def _load_one(path_str: str):
-    """h5 파일 하나를 읽어 (cotend, theta, max_lat) 반환. 실패 시 None."""
+    """h5 파일 하나를 읽어 (cotend, theta, max_lat) 반환. 실패 또는 valid=False 시 None."""
     try:
         with h5py.File(path_str, "r") as f:
+            if not bool(f["labels/valid"][()]):
+                return None
             cotend  = f["output/cotend_hidden_state"][:].astype(np.float32)
             w       = f["labels/mpc_weights"][:]
             lat_y   = f["gt/future_xyz"][:20, 1]
@@ -85,48 +90,32 @@ def _load_one(path_str: str):
 
 class CotendDataset(Dataset):
     """
-    split 디렉토리(train/ or val/ or test/)의 h5 파일을 로드.
-    반환: (cotend float32 (4096,), theta float32 (5,))
+    prepare/{split}/ 의 h5 파일을 로드. 캐시는 prepare/ 바로 아래에 저장.
+    반환: (cotend float32 (4096,), theta float32 (4,))
     theta = log(mpc_weights[PREDICT_IDX])  — log-scale
+    labels/valid=False 샘플은 스킵.
     """
 
-    def __init__(self, split_dir: Path, name: str = "", workers: int = 8,
-                 rebuild_cache: bool = False, data_dir: Path | None = None):
+    def __init__(self, split_dir: Path, cache_dir: Path, name: str = "",
+                 rebuild_cache: bool = False):
         label      = f"[{name}]" if name else ""
-        cache_path = split_dir / "_mlp_cache.npz"
+        cache_path = cache_dir / f"_mlp_cache_{name}.npz"
 
-        # ── 캐시 히트: npz 1개 읽기 (~2초) ────────────────
+        # ── 캐시 히트 ──────────────────────────────────────
         if cache_path.exists() and not rebuild_cache:
             data = np.load(cache_path)
             self.cotend  = torch.from_numpy(np.array(data["cotend"]))
             self.theta   = torch.from_numpy(np.array(data["theta"]))
             self.max_lat = torch.from_numpy(np.array(data["max_lat"]))
-            print(f"  {label:<8} {len(self.cotend):,}개 (캐시)")
+            print(f"  {label:<8} {len(self.cotend):,}개 (캐시: {cache_path.name})")
             return
 
-        # ── 캐시 미스: h5 파일 순차 로드 후 캐시 저장 ────
-        # IPC pickle 비용(~1GB) > 병렬화 이득 → 순차 로드
+        # ── 캐시 미스: h5 순차 로드 ───────────────────────
         h5_files = sorted(split_dir.glob("*.h5"))
-
-        # 심볼릭 링크 없음 → manifest + data_dir 폴백 (Windows symlink 불가 환경)
-        if not h5_files and data_dir is not None:
-            manifest_path = split_dir.parent / "dataset_manifest.json"
-            split_name    = split_dir.name          # "train" / "val" / "test"
-            if manifest_path.exists():
-                with open(manifest_path) as _f:
-                    _m = json.load(_f)
-                clip_ids = set(_m.get(f"clips_{split_name}", []))
-                if clip_ids:
-                    h5_files = sorted(
-                        p for p in Path(data_dir).glob("*.h5")
-                        if p.stem.split("__")[0] in clip_ids
-                    )
-                    print(f"  {label:<8} manifest 기반 {len(h5_files):,}개 ({data_dir})")
-
         if not h5_files:
             raise RuntimeError(
                 f"{split_dir} 에 .h5 파일이 없습니다.\n"
-                "  prepare_dataset.py 실행 후 data/prepare/ 구조를 확인하세요."
+                "  label_mpc_weights.py 실행 후 data/prepare/{split}/ 구조를 확인하세요."
             )
 
         cotends, thetas, max_lats = [], [], []
@@ -141,7 +130,7 @@ class CotendDataset(Dataset):
                 max_lats.append(r[2])
 
         if not cotends:
-            raise RuntimeError(f"{split_dir}: 로드 가능한 샘플이 없습니다.")
+            raise RuntimeError(f"{split_dir}: valid 샘플이 없습니다.")
 
         cotend_arr  = np.stack(cotends)
         theta_arr   = np.stack(thetas)
@@ -154,8 +143,8 @@ class CotendDataset(Dataset):
         self.max_lat = torch.from_numpy(max_lat_arr)
 
         print(f"  {label:<8} {len(self.cotend):,}개 로드"
-              + (f"  (스킵 {skipped}개)" if skipped else "")
-              + f"  → 캐시 저장: {cache_path.name}")
+              + (f"  (스킵/invalid {skipped}개)" if skipped else "")
+              + f"  → 캐시: {cache_path.name}")
 
     def __len__(self):
         return len(self.cotend)
@@ -253,10 +242,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--split-dir",    required=True,
-                        help="split_dataset.py 로 생성된 디렉토리 (split_manifest.json 포함)")
-    parser.add_argument("--data-dir",     default=None,
-                        help="원본 .h5 디렉토리. 심볼릭 링크 없을 때 manifest와 함께 사용")
+    parser.add_argument("--data-dir",     required=True,
+                        help="prepare/ 베이스 디렉토리 (하위에 train/ val/ test/ 존재)")
     parser.add_argument("--out",          default="mlp_out",
                         help="출력 디렉토리 (default: mlp_out)")
     parser.add_argument("--epochs",       type=int,   default=300)
@@ -272,7 +259,6 @@ def main():
     parser.add_argument("--compile",      action="store_true",
                         help="torch.compile (Linux + PyTorch 2.0+, Windows 불가)")
     parser.add_argument("--num-workers",  type=int,   default=0)
-    parser.add_argument("--load-workers", type=int,   default=8)
     parser.add_argument("--rebuild-cache", action="store_true",
                         help="캐시 무시하고 h5에서 재로드")
     parser.add_argument("--balance",      action="store_true",
@@ -291,19 +277,11 @@ def main():
     torch.backends.cudnn.benchmark     = False
     torch.set_float32_matmul_precision("high")
 
-    out_dir   = Path(args.out)
-    split_dir = Path(args.split_dir)
+    out_dir  = Path(args.out)
+    data_dir = Path(args.data_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     logger = setup_logger(out_dir)
-
-    manifest_path = split_dir / "split_manifest.json"
-    if not manifest_path.exists():
-        raise FileNotFoundError(
-            f"{manifest_path} 없음. split_dataset.py를 먼저 실행하세요."
-        )
-
-    data_dir = Path(args.data_dir) if args.data_dir else None
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
@@ -313,15 +291,12 @@ def main():
     # ── 데이터 로드 ────────────────────────────────────
     print("\n데이터 로드 중...")
     t0 = time.perf_counter()
-    train_ds = CotendDataset(split_dir / "train", name="train",
-                             workers=args.load_workers, rebuild_cache=args.rebuild_cache,
-                             data_dir=data_dir)
-    val_ds   = CotendDataset(split_dir / "val",   name="val",
-                             workers=args.load_workers, rebuild_cache=args.rebuild_cache,
-                             data_dir=data_dir)
-    test_ds  = CotendDataset(split_dir / "test",  name="test",
-                             workers=args.load_workers, rebuild_cache=args.rebuild_cache,
-                             data_dir=data_dir)
+    train_ds = CotendDataset(data_dir / "train", cache_dir=data_dir,
+                             name="train", rebuild_cache=args.rebuild_cache)
+    val_ds   = CotendDataset(data_dir / "val",   cache_dir=data_dir,
+                             name="val",   rebuild_cache=args.rebuild_cache)
+    test_ds  = CotendDataset(data_dir / "test",  cache_dir=data_dir,
+                             name="test",  rebuild_cache=args.rebuild_cache)
     print(f"  로드 완료: {time.perf_counter()-t0:.1f}s")
 
     n_train, n_val, n_test = len(train_ds), len(val_ds), len(test_ds)
