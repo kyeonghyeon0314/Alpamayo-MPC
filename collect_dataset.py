@@ -84,10 +84,14 @@
 
 import argparse
 import csv
+import os
 import queue
 import threading
 import logging
 import sys
+
+# fork 전에 tokenizers 병렬처리 비활성화 → 시각화 서브프로세스 fork 시 데드락 방지
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 import torch
 
@@ -161,6 +165,13 @@ def _parse_args() -> argparse.Namespace:
         metavar="DIR",
         help="로컬 데이터셋 디렉토리 (기본: /workspace/alpamayo_dataset/data/nvidia_test_scenario)",
     )
+    parser.add_argument(
+        "--prepare-dir",
+        default="/workspace/Alpamayo-MPC/alpamayo_dataset/data/prepare",
+        metavar="DIR",
+        help="prepare_dataset.py 결과 디렉토리. 이미 분할된 h5는 재수집 건너뜀 "
+             "(기본: alpamayo_dataset/data/prepare)",
+    )
     return parser.parse_args()
 
 
@@ -175,6 +186,7 @@ def _download_worker(
     avdi,
     output_dir: str,
     overwrite: bool,
+    prepared_stems: frozenset,
 ) -> None:
     """병렬 다운로드 워커 스레드 (클립 단위 배치 다운로드).
 
@@ -197,10 +209,12 @@ def _download_worker(
         clip_id, t0_us_list = item
 
         # 이미 존재하는 파일은 즉시 skip 결과로 처리, 나머지만 다운로드
+        # collected/ 직접 확인 + prepare/{train,val,test,error}/ 에 이미 이동된 것도 건너뜀
         pending = []
         for t0_us in t0_us_list:
-            out_path = out_dir / f"{clip_id}__{t0_us}.h5"
-            if out_path.exists() and not overwrite:
+            stem = f"{clip_id}__{t0_us}"
+            out_path = out_dir / f"{stem}.h5"
+            if not overwrite and (out_path.exists() or stem in prepared_stems):
                 result_q.put({"type": "skip", "clip_id": clip_id, "t0_us": t0_us})
             else:
                 pending.append(t0_us)
@@ -269,6 +283,18 @@ def main() -> None:
     clip_groups = [(cid, _clip_map[cid]) for cid in _clip_order]
     log.info("고유 클립 %d개 (클립당 평균 %.1f개 타임스텝) → 클립당 스트리밍 1회",
              len(clip_groups), len(clips) / max(len(clip_groups), 1))
+
+    # prepare/ 서브폴더에 이미 이동된 h5 스템 수집 → 재수집 방지
+    import pathlib as _pathlib
+    _prepare_dir = _pathlib.Path(args.prepare_dir)
+    prepared_stems: frozenset = frozenset(
+        h5.stem
+        for sub in ("train", "val", "test", "error")
+        for h5 in (_prepare_dir / sub).glob("*.h5")
+        if (_prepare_dir / sub).exists()
+    )
+    if prepared_stems:
+        log.info("prepare/ 에서 기존 %d개 감지 → 재수집 건너뜀", len(prepared_stems))
 
     # 재현성을 위한 CUDA 시드 고정
     torch.cuda.manual_seed_all(args.seed)
@@ -366,7 +392,7 @@ def main() -> None:
     for wid in range(1, n_workers + 1):
         t = threading.Thread(
             target=_download_worker,
-            args=(wid, work_q, result_q, collector, avdi, args.output_dir, args.overwrite),
+            args=(wid, work_q, result_q, collector, avdi, args.output_dir, args.overwrite, prepared_stems),
             daemon=True,
             name=f"download-{wid}",
         )

@@ -200,12 +200,24 @@ class AlpamayoDatasetCollector:
         sample = self._build_sample(raw, pred_xyz, pred_rot, extra)
 
         # 3. PNG 시각화 (카메라 이미지가 메모리에 있는 동안 생성)
+        # 서브프로세스로 격리: matplotlib 내부 SIGILL/SIGSEGV가 메인 프로세스를 죽이지 않도록 함
         if self._do_viz and sample.camera_images is not None:
+            import multiprocessing as _mp
             log.info("  [3/4] 시각화 저장 중...")
             viz_path = self.viz_dir / f"{clip_id}__{t0_us}.png"
             try:
-                _visualize_sample(sample, viz_path)
-                log.info("        → %s", viz_path.name)
+                proc = _mp.Process(
+                    target=_visualize_sample,
+                    args=(sample, viz_path),
+                    daemon=True,
+                )
+                proc.start()
+                proc.join(timeout=60)
+                if proc.exitcode == 0:
+                    log.info("        → %s", viz_path.name)
+                else:
+                    log.warning("시각화 실패 (exitcode=%s, 계속 진행): %s",
+                                proc.exitcode, viz_path.name)
             except Exception:
                 log.warning("시각화 실패 (계속 진행): %s", viz_path.name, exc_info=True)
         else:
