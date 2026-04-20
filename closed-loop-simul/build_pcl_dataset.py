@@ -137,6 +137,7 @@ def _download_worker(
         clip_end_us = min(ego_end_us, cam_end_us)
 
         t0_min = clip_start_us + _HIST_DUR_US
+        t0_min = -(-t0_min // step_us) * step_us  # step_us 배수로 올림 정렬
         t0_max = clip_end_us   - _FUT_DUR_US
 
         if t0_min > t0_max:
@@ -299,6 +300,7 @@ def main() -> None:
                 )
                 clip_end_us = min(ego_end_us, cam_end_us)
                 t0_min = clip_start_us + _HIST_DUR_US
+                t0_min = -(-t0_min // args.step_us) * args.step_us
                 t0_max = clip_end_us   - _FUT_DUR_US
                 if t0_min > t0_max:
                     continue
