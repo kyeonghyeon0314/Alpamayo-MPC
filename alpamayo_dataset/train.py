@@ -249,12 +249,12 @@ def main():
     parser.add_argument("--epochs",       type=int,   default=300)
     parser.add_argument("--batch-size",   type=int,   default=512,
                         help="배치 크기 (default: 512, RTX 5060 8GB 충분)")
-    parser.add_argument("--lr",           type=float, default=2e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--dropout",      type=float, default=0.1)
+    parser.add_argument("--lr",           type=float, default=0.002)
+    parser.add_argument("--weight-decay", type=float, default=0.0001)
+    parser.add_argument("--dropout",      type=float, default=0.2)
     parser.add_argument("--hidden",       type=int,   nargs="+",
                         help="히든 레이어 크기 (default: 1024 256)")
-    parser.add_argument("--patience",     type=int,   default=30)
+    parser.add_argument("--patience",     type=int,   default=40)
     parser.add_argument("--seed",         type=int,   default=42)
     parser.add_argument("--compile",      action="store_true",
                         help="torch.compile (Linux + PyTorch 2.0+, Windows 불가)")

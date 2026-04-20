@@ -89,20 +89,14 @@ W_DEFAULTS = np.array([2.0, 1.0, 5.0, 1.0])
 THETA0 = np.log(W_DEFAULTS)
 
 # 탐색 공간 경계 (log-scale)
-# R 하한을 충분히 높게 유지해 Q>>R 퇴화 방지
+# 범위를 좁혀 equifinality 억제: heading/steer_rate가 경계로 수렴하는 현상 방지
 #                         long   head   steer_r  accel_r
-_THETA_MIN = np.log([ 0.1,   0.1,   1.0,    0.2  ])
-_THETA_MAX = np.log([ 10.,   10.,   25.,    10.  ])
+_THETA_MIN = np.log([ 0.5,   0.5,   1.0,    0.2  ])
+_THETA_MAX = np.log([10.,    5.,   10.,     5.  ])
 _BOUNDS_LOG = list(zip(_THETA_MIN, _THETA_MAX))
-
-# Tikhonov 정규화 강도: 기본값 θ₀ 근처로 해를 당기는 편향 — 순수 ADE 최적화 시 0.0 사용
-# λ=0.002: degenerate 경계(||Δθ||²≈35)에서 ~0.07m 추가 비용 → CLI --reg-lambda로 설정
-# λ=0.0: 순수 ADE (bounds로 발산 방지 충분)
-_REG_LAMBDA = 0.0
 
 # ── 목적함수 가중치 ──────────────────────────────────────────
 # 목적함수 = W_ADE_PENALTY * (ADE_xy + W_YAW_ADE * ADE_yaw)
-#           + λ * ||θ - θ₀||²
 # ADE_xy [m], ADE_yaw [rad]
 # W_YAW_ADE=0 이면 기존 xy-only ADE와 동일
 W_ADE_PENALTY: float = 1.0
@@ -292,7 +286,6 @@ class MPCLabeler:
         log-parameterized 가중치 theta (4,) → 목적함수 값 [m 등가].
 
         목적함수 = W_ADE_PENALTY * (ADE_xy + W_YAW_ADE * ADE_yaw)
-                 + λ * ||theta - THETA0||²
 
           ADE_xy  [m]   — 첫 N_EVAL=15 스텝 xy 평균 L2 거리
           ADE_yaw [rad] — 첫 N_EVAL=15 스텝 yaw 평균 절대 오차
@@ -408,8 +401,7 @@ class MPCLabeler:
         norms   = np.linalg.norm(e_xy, axis=1)          # (N_EVAL,)
         ade_xy  = float(np.mean(norms))
         ade_yaw = float(np.mean(np.abs(e_yaw)))
-        reg     = _REG_LAMBDA * float(np.sum((theta - THETA0) ** 2))
-        val     = W_ADE_PENALTY * (ade_xy + W_YAW_ADE * ade_yaw) + reg
+        val     = W_ADE_PENALTY * (ade_xy + W_YAW_ADE * ade_yaw)
 
         # ── 제약 활성 여부 확인 → 활성 시 수치 미분 폴백 ──────
         _TOL = 1e-4
@@ -441,16 +433,19 @@ class MPCLabeler:
         # dJ/dθᵢ = -grad_U · H⁻¹ vᵢ  (solve 4 RHS at once)
         grad = -(grad_U @ np.linalg.solve(H, V))   # (4,)
 
-        if _REG_LAMBDA > 0:
-            grad += 2.0 * _REG_LAMBDA * (theta - THETA0)
-
         return val, grad
 
     # ── Outer Optimization ────────────────────────────
 
-    def optimize(self, max_iter: int = 200) -> dict:
+    def optimize(self, max_iter: int = 200,
+                 theta_prev: np.ndarray | None = None,
+                 lambda_smooth: float = 0.0) -> dict:
         """
         L-BFGS-B로 4개 가중치 (log-scale) 최적화.
+
+        theta_prev:    이전 프레임의 theta (클립 내 warm-start 및 smoothness 페널티용)
+        lambda_smooth: 클립 내 시간적 일관성 강도. 목적함수에
+                       lambda_smooth * ||θ - θ_prev||² 항 추가.
 
         해석적 기울기(jac=True) 사용:
           - 비제약 케이스(다수): 정확한 기울기 → 수치 미분 대비 ~5× 빠름
@@ -459,8 +454,15 @@ class MPCLabeler:
         """
         t0 = time.perf_counter()
 
+        use_smooth = lambda_smooth > 0.0 and theta_prev is not None
+
         def _obj(theta: np.ndarray) -> tuple[float, np.ndarray]:
             val, grad = self._rollout_val_and_grad(theta)
+            if use_smooth:
+                diff  = theta - theta_prev
+                val  += lambda_smooth * float(np.dot(diff, diff))
+                if grad is not None:
+                    grad = grad + 2.0 * lambda_smooth * diff
             if grad is not None:
                 return val, grad
             # 수치 미분 폴백 (제약 활성 케이스)
@@ -471,9 +473,13 @@ class MPCLabeler:
                 grad[i] = (self.rollout_ade(th_h) - val) / eps
             return val, grad
 
+        theta_init = np.clip(
+            theta_prev if theta_prev is not None else THETA0,
+            _THETA_MIN, _THETA_MAX,
+        )
         res = scipy.optimize.minimize(
             _obj,
-            np.clip(THETA0, _THETA_MIN, _THETA_MAX),
+            theta_init,
             method="L-BFGS-B",
             jac=True,
             bounds=_BOUNDS_LOG,
@@ -503,21 +509,21 @@ class MPCLabeler:
             w_opt[0], W_LAT_FIXED, w_opt[1], w_opt[2], w_opt[3],
         ], dtype=np.float32)
 
-        # h5 저장·필터링용 지표 (reg 제외, QP 재풀이 3회)
-        ade_xy  = self._compute_ade_xy(res.x)            # xy ADE [m]  — threshold 필터링 기준
-        ade_yaw = self._compute_ade_yaw(res.x)           # yaw ADE [rad] — 시각화용
+        ade_xy  = self._compute_ade_xy(res.x)
+        ade_yaw = self._compute_ade_yaw(res.x)
         steer_rate_rms, jerk_rms = self._compute_comfort_metrics(res.x)
 
         return {
             "weights":        weights,
-            "ade":            ade_xy,             # xy ADE [m] — threshold 필터링 기준
-            "ade_yaw":        ade_yaw,            # yaw ADE [rad] — 시각화용
-            "objective":      float(res.fun),     # 최적화 목적함수 값 (ADE_xy+W_YAW*ADE_yaw+reg)
+            "theta_opt":      res.x.copy(),       # 클립 내 다음 프레임 warm-start용
+            "ade":            ade_xy,
+            "ade_yaw":        ade_yaw,
+            "objective":      float(res.fun),
             "success":        bool(res.success),
             "n_evals":        int(res.nfev),
             "elapsed_s":      elapsed,
-            "steer_rate_rms": steer_rate_rms,     # [rad/step] — 모니터링용
-            "jerk_rms":       jerk_rms,           # [(m/s²)/step] — 모니터링용
+            "steer_rate_rms": steer_rate_rms,
+            "jerk_rms":       jerk_rms,
         }
 
 
@@ -525,12 +531,11 @@ class MPCLabeler:
 # 멀티프로세싱 Worker 초기화
 # ══════════════════════════════════════════════════════
 
-def _init_worker(w_ade: float, w_yaw: float, reg_lambda: float) -> None:
+def _init_worker(w_ade: float, w_yaw: float) -> None:
     """Pool worker 프로세스에서 objective 가중치를 전역 변수로 설정."""
-    global W_ADE_PENALTY, W_YAW_ADE, _REG_LAMBDA
+    global W_ADE_PENALTY, W_YAW_ADE
     W_ADE_PENALTY = w_ade
     W_YAW_ADE     = w_yaw
-    _REG_LAMBDA   = reg_lambda
 
 
 # ══════════════════════════════════════════════════════
@@ -560,7 +565,7 @@ def _save_index(data_dir: Path, labeled: set[str]) -> None:
 # ══════════════════════════════════════════════════════
 
 def _label_one(args: tuple) -> dict:
-    h5_path, ade_threshold, max_iter = args
+    h5_path, ade_threshold, max_iter, theta_prev, lambda_smooth = args
     name = Path(h5_path).name
     result = {"path": str(h5_path), "status": "error", "ade": float("nan")}
 
@@ -571,12 +576,10 @@ def _label_one(args: tuple) -> dict:
             hist_curv = f["input/ego_history_curv"][:]         # (16, 1)
             hist_quat = f["input/ego_history_quat_global"][:]  # (16, 4) [qx,qy,qz,qw]
 
-            # LTV 선형화에 필요한 속도·가속도 (gt_smooth 여부와 무관하게 항상 로드)
             gt_ego_raw   = f["gt/future_ego_states"][:]        # (64, 5)
-            gt_speed     = gt_ego_raw[:, 2]                    # 종방향 속도 [m/s]
-            gt_lon_accel = gt_ego_raw[:, 4]                    # 종방향 가속도 [m/s²]
+            gt_speed     = gt_ego_raw[:, 2]
+            gt_lon_accel = gt_ego_raw[:, 4]
 
-            # GT 소스: gt_smooth/ 우선, 없으면 raw gt/ 폴백
             if "gt_smooth" in f:
                 gt_xy  = f["gt_smooth/future_xy"][:]           # (64, 2)
                 gt_yaw = f["gt_smooth/future_yaw"][:]          # (64,)
@@ -585,10 +588,11 @@ def _label_one(args: tuple) -> dict:
                 gt_xy  = gt_xyz[:, :2]
                 gt_yaw = gt_ego_raw[:, 3]
 
-        # t0 초기 상태 복원
         x0      = compute_x0(hist[-1, 2], hist[-1, 4], hist_vel[-1], hist_curv[-1, 0], hist_quat[-1])
         labeler = MPCLabeler(x0, gt_xy, gt_yaw, gt_speed, gt_lon_accel)
-        opt     = labeler.optimize(max_iter=max_iter)
+        opt     = labeler.optimize(max_iter=max_iter,
+                                   theta_prev=theta_prev,
+                                   lambda_smooth=lambda_smooth)
 
         # h5에 결과 저장
         with h5py.File(h5_path, "a") as f:
@@ -616,6 +620,7 @@ def _label_one(args: tuple) -> dict:
         result.update({
             "status":          status,
             "ade":             opt["ade"],
+            "theta_opt":       opt["theta_opt"],   # 다음 프레임 warm-start용
             "steer_rate_rms":  opt["steer_rate_rms"],
             "jerk_rms":        opt["jerk_rms"],
             "n_evals":         opt["n_evals"],
@@ -627,6 +632,34 @@ def _label_one(args: tuple) -> dict:
         logging.exception("ERROR %s — %s", name, e)
 
     return result
+
+
+def _clip_sort_key(p: Path) -> int:
+    """파일명 {uuid}__{timestamp}.h5 에서 타임스탬프(정수)를 추출해 시간순 정렬."""
+    try:
+        return int(p.stem.split("__")[1])
+    except (IndexError, ValueError):
+        return 0
+
+
+def _label_clip(args: tuple) -> list[dict]:
+    """
+    같은 클립에 속한 h5 파일들을 시간순으로 처리.
+    이전 프레임의 theta_opt를 다음 프레임의 warm-start 및 smoothness 기준으로 전달.
+    """
+    clip_files, ade_threshold, max_iter, lambda_smooth = args
+    sorted_files = sorted(clip_files, key=_clip_sort_key)
+    theta_prev   = None   # 첫 프레임은 THETA0에서 시작
+    results      = []
+
+    for h5_path in sorted_files:
+        r = _label_one((str(h5_path), ade_threshold, max_iter, theta_prev, lambda_smooth))
+        results.append(r)
+        # 성공한 프레임의 theta만 다음 프레임으로 전달
+        if r.get("status") in ("ok", "filtered") and "theta_opt" in r:
+            theta_prev = r["theta_opt"]
+
+    return results
 
 
 # ══════════════════════════════════════════════════════
@@ -655,10 +688,11 @@ def main():
                         help="ADE 전체 스케일 가중치 (default: 1.0)")
     parser.add_argument("--w-yaw-ade",      type=float, default=2.0,
                         help="yaw ADE 가중치 [rad → m 등가] (default: 2.0, 0=xy-only)")
-    parser.add_argument("--reg-lambda",     type=float, default=0.0,
-                        help="Tikhonov 정규화 강도 λ (default: 0.0)")
-    parser.add_argument("--viz-n",          type=int,   default=6,
-                        help="레이블링 후 시각화할 랜덤 샘플 수 (default: 6, 0=생략)")
+    parser.add_argument("--lambda-smooth",  type=float, default=0.1,
+                        help="클립 내 시간적 일관성 강도 (default: 0.1, 0=비활성)")
+    parser.add_argument("--viz-n",          type=int,   default=3,
+                        help="레이블링 후 시각화할 랜덤 클립 수 (default: 3, 0=생략). "
+                             "선택된 클립의 모든 프레임을 시간순으로 저장.")
     parser.add_argument("--viz-dir",        type=str,   default=None,
                         help="시각화 PNG 저장 경로 (default: --data-dir/viz)")
     args = parser.parse_args()
@@ -666,13 +700,13 @@ def main():
     base_dir = Path(args.data_dir)
 
     # ── objective 가중치 설정 (main 프로세스용) ──────────────────
-    global W_ADE_PENALTY, W_YAW_ADE, _REG_LAMBDA
-    W_ADE_PENALTY = args.w_ade_penalty
-    W_YAW_ADE     = args.w_yaw_ade
-    _REG_LAMBDA   = args.reg_lambda
+    global W_ADE_PENALTY, W_YAW_ADE
+    W_ADE_PENALTY   = args.w_ade_penalty
+    W_YAW_ADE       = args.w_yaw_ade
+    lambda_smooth   = args.lambda_smooth
     logging.info(
-        "objective  w_ade=%.3f  w_yaw_ade=%.3f  reg_lambda=%.4f",
-        W_ADE_PENALTY, W_YAW_ADE, _REG_LAMBDA,
+        "objective  w_ade=%.3f  w_yaw_ade=%.3f  lambda_smooth=%.4f",
+        W_ADE_PENALTY, W_YAW_ADE, lambda_smooth,
     )
 
     # ── split별 파일 수집 + 인덱스 기반 사전 필터링 ──────────────
@@ -723,49 +757,59 @@ def main():
             args.seed if args.seed is not None else "None",
         )
 
+    # ── 클립 단위로 그룹화 ────────────────────────────────
+    clip_groups: dict[str, list[Path]] = {}
+    for p in h5_files:
+        clip_id = p.stem.split("__")[0]
+        clip_groups.setdefault(clip_id, []).append(p)
+
+    n_clips = len(clip_groups)
     logging.info(
-        "처리 대상: %d 파일 | splits=%s | workers=%d | ade_threshold=%.2f m",
-        len(h5_files), args.splits, args.workers, args.ade_threshold,
+        "처리 대상: %d 파일 / %d 클립 | splits=%s | workers=%d | "
+        "ade_threshold=%.2f m | lambda_smooth=%.3f",
+        len(h5_files), n_clips, args.splits, args.workers,
+        args.ade_threshold, lambda_smooth,
     )
 
-    tasks = [
-        (p, args.ade_threshold, args.max_iter)
-        for p in h5_files
+    clip_tasks = [
+        (files, args.ade_threshold, args.max_iter, lambda_smooth)
+        for files in clip_groups.values()
     ]
 
     results: list[dict] = []
     t_start = time.perf_counter()
 
-    def _run_with_progress(iterator, total: int) -> None:
-        """tqdm 진행바 + 500샘플마다 요약 통계 출력."""
+    def _run_with_progress(clip_iterator, total_files: int) -> None:
+        """클립 단위 iterator에서 프레임 결과를 flatten해 tqdm 진행바 표시."""
         ok = filtered = errors = 0
-        with tqdm(total=total, unit="샘플", desc="레이블링",
+        with tqdm(total=total_files, unit="샘플", desc="레이블링",
                   bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]"
                   ) as pbar:
-            for r in iterator:
-                results.append(r)
-                if   r["status"] == "ok":       ok += 1
-                elif r["status"] == "filtered": filtered += 1
-                elif r["status"] == "error":    errors   += 1
+            for clip_results in clip_iterator:
+                for r in clip_results:
+                    results.append(r)
+                    if   r["status"] == "ok":       ok += 1
+                    elif r["status"] == "filtered": filtered += 1
+                    elif r["status"] == "error":    errors   += 1
 
-                pbar.set_postfix({
-                    "ok": ok, "filt": filtered, "err": errors,
-                    "ADE": f"{r['ade']:.3f}" if r["status"] == "ok" else "-",
-                }, refresh=False)
-                pbar.update(1)
+                    pbar.set_postfix({
+                        "ok": ok, "filt": filtered, "err": errors,
+                        "ADE": f"{r['ade']:.3f}" if r["status"] == "ok" else "-",
+                    }, refresh=False)
+                    pbar.update(1)
 
 
     if args.workers == 1:
-        _run_with_progress((_label_one(t) for t in tasks), len(tasks))
+        _run_with_progress((_label_clip(t) for t in clip_tasks), len(h5_files))
     else:
         with mp.Pool(
             processes=args.workers,
             initializer=_init_worker,
-            initargs=(W_ADE_PENALTY, W_YAW_ADE, _REG_LAMBDA),
+            initargs=(W_ADE_PENALTY, W_YAW_ADE),
         ) as pool:
             _run_with_progress(
-                pool.imap_unordered(_label_one, tasks, chunksize=1),
-                len(tasks),
+                pool.imap_unordered(_label_clip, clip_tasks, chunksize=1),
+                len(h5_files),
             )
 
     elapsed = time.perf_counter() - t_start
@@ -787,7 +831,7 @@ def main():
     )
     logging.info(
         "경과: %.1fs (평균 %.2fs/샘플)",
-        elapsed, elapsed / max(len(tasks), 1),
+        elapsed, elapsed / max(len(h5_files), 1),
     )
 
     valid = by_status["ok"]
@@ -830,42 +874,54 @@ def main():
             logging.info("인덱스 업데이트 [%s]: %d개 → %s",
                          split_dir.name, len(updated), split_dir / _INDEX_FILE)
 
-    # ── 시각화 (성공 샘플 랜덤 N개) ────────────────────
+    # ── 시각화 (랜덤 N 클립, 클립 내 프레임 시간순) ──────
     if args.viz_n > 0:
         viz_dir = Path(args.viz_dir) if args.viz_dir else base_dir / "label_viz"
         _save_label_viz(
             ok_paths=[Path(r["path"]) for r in by_status["ok"]],
             viz_dir=viz_dir,
-            n=args.viz_n,
+            n_clips=args.viz_n,
             seed=args.seed if args.seed is not None else 42,
         )
 
 
 def _save_label_viz(
-    ok_paths: list[Path],
-    viz_dir:  Path,
-    n:        int,
-    seed:     int,
+    ok_paths:  list[Path],
+    viz_dir:   Path,
+    n_clips:   int,
+    seed:      int,
 ) -> None:
-    """성공 샘플 중 랜덤 n개를 viz_mpc_label.plot_single로 PNG 저장."""
+    """
+    성공 샘플을 클립 단위로 그룹화한 뒤 랜덤으로 n_clips개 클립을 선택해
+    각 클립 내 프레임을 시간순으로 연속 저장.
+    출력 파일명: {clip_id}__{timestamp}_mpc_viz.png (시간순 정렬로 탐색기에서 연속 표시)
+    """
     if not ok_paths:
         logging.warning("No labeled samples to visualize.")
         return
 
+    # 클립 단위 그룹화
+    clip_map: dict[str, list[Path]] = {}
+    for p in ok_paths:
+        clip_id = p.stem.split("__")[0]
+        clip_map.setdefault(clip_id, []).append(p)
+
     import random as _rnd
     rng = _rnd.Random(seed)
-    samples = rng.sample(ok_paths, min(n, len(ok_paths)))
+    selected_clips = rng.sample(sorted(clip_map.keys()), min(n_clips, len(clip_map)))
 
-    # viz_mpc_label은 같은 디렉토리에 있음
     from viz_mpc_label import plot_single
 
     viz_dir.mkdir(parents=True, exist_ok=True)
-    for h5_path in samples:
-        try:
-            plot_single(h5_path, viz_dir)
-            logging.info("Viz saved: %s", viz_dir / f"{h5_path.stem}_mpc_viz.png")
-        except Exception as e:
-            logging.warning("Viz failed %s — %s", h5_path.name, e)
+    for clip_id in selected_clips:
+        frames = sorted(clip_map[clip_id], key=_clip_sort_key)
+        logging.info("클립 [%s] %d 프레임 시각화", clip_id[:8], len(frames))
+        for h5_path in frames:
+            try:
+                plot_single(h5_path, viz_dir)
+                logging.info("  Viz saved: %s", viz_dir / f"{h5_path.stem}_mpc_viz.png")
+            except Exception as e:
+                logging.warning("  Viz failed %s — %s", h5_path.name, e)
 
 
 if __name__ == "__main__":
