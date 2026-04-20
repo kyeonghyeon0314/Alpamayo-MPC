@@ -1,7 +1,7 @@
 # check_labels.py
 import h5py, numpy as np, glob
 
-paths = sorted(glob.glob("alpamayo_dataset/data/collected/002dec8e-3d95-4cc2-abbe-99b3a2e78618__11000000.h5"))[:10]
+paths = sorted(glob.glob("alpamayo_dataset/data/prepare/train/*.h5"))[:10]
 for path in paths:
     with h5py.File(path, "r") as f:
         if "labels/mpc_weights" not in f:

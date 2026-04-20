@@ -8,22 +8,22 @@ GT 궤적 및 기본 가중치 궤적과 비교합니다.
 사용법:
     # 라벨 있는 파일 전부 페이지네이션 격자로 저장
     python alpamayo_dataset/viz_mpc_label.py \
-        --data-dir alpamayo_dataset/data/collected \
+        --data-dir alpamayo_dataset/data/prepare/train \
         --all --out viz_out
 
     # 페이지당 셀 수 조정 (기본 20)
     python alpamayo_dataset/viz_mpc_label.py \
-        --data-dir alpamayo_dataset/data/collected \
+        --data-dir alpamayo_dataset/data/prepare/train \
         --all --page-size 30 --out viz_out
 
     # 상세 플롯 N개 (궤적+제어+가중치)
     python alpamayo_dataset/viz_mpc_label.py \
-        --data-dir alpamayo_dataset/data/collected \
+        --data-dir alpamayo_dataset/data/prepare/train \
         --n-samples 12 --out viz_out
 
     # 특정 파일 단일 상세 플롯
     python alpamayo_dataset/viz_mpc_label.py \
-        --file alpamayo_dataset/data/collected/xxx.h5 \
+        --file alpamayo_dataset/data/prepare/train/xxx.h5 \
         --out viz_out
 
 결과: viz_out/ 디렉토리에 PNG 저장

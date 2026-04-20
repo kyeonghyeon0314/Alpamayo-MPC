@@ -110,7 +110,7 @@ class CotendDataset(Dataset):
 
         # 심볼릭 링크 없음 → manifest + data_dir 폴백 (Windows symlink 불가 환경)
         if not h5_files and data_dir is not None:
-            manifest_path = split_dir.parent / "split_manifest.json"
+            manifest_path = split_dir.parent / "dataset_manifest.json"
             split_name    = split_dir.name          # "train" / "val" / "test"
             if manifest_path.exists():
                 with open(manifest_path) as _f:
@@ -126,8 +126,7 @@ class CotendDataset(Dataset):
         if not h5_files:
             raise RuntimeError(
                 f"{split_dir} 에 .h5 파일이 없습니다.\n"
-                "  심볼릭 링크: split_dataset.py 실행\n"
-                "  또는 --data-dir 로 원본 h5 디렉토리를 지정하세요."
+                "  prepare_dataset.py 실행 후 data/prepare/ 구조를 확인하세요."
             )
 
         cotends, thetas, max_lats = [], [], []

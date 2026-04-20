@@ -37,12 +37,12 @@ MPC 구조: Condensed Linear MPC
 실행 예시:
   # 동작 확인 (파일 5개)
   python /workspace/alpamayo_dataset/label_mpc_weights.py \
-      --data-dir /workspace/alpamayo_dataset/data/collected \
+      --data-dir /workspace/alpamayo_dataset/data/prepare/train \
       --dry-run
 
   # 전체 실행
   python /workspace/alpamayo_dataset/label_mpc_weights.py \
-      --data-dir /workspace/alpamayo_dataset/data/collected \
+      --data-dir /workspace/alpamayo_dataset/data/prepare/train \
       --workers 8 --ade-threshold 0.5 --overwrite
 
 의존성: numpy, scipy, h5py  (pip install scipy h5py)

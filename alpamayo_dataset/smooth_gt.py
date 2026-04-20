@@ -15,7 +15,7 @@ Output (h5 gt_smooth/ group):
 
 Usage:
   python smooth_gt.py \\
-      --data-dir /workspace/alpamayo_dataset/data/collected \\
+      --data-dir /workspace/alpamayo_dataset/data/prepare/train \\
       --lambda-xy 1.0 --lambda-yaw 1.0 --workers 8 \\
       --viz-n 6 --overwrite
 """
@@ -38,7 +38,7 @@ logging.basicConfig(
 # ══════════════════════════════════════════════════════
 # Paths  ← edit as needed
 # ══════════════════════════════════════════════════════
-DATA_DIR = "./alpamayo_dataset/data/collected"
+DATA_DIR = "./alpamayo_dataset/data/prepare/train"
 VIZ_DIR  = "./alpamayo_dataset/data/smooth_viz"
 
 # ══════════════════════════════════════════════════════

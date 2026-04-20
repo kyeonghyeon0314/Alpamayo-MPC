@@ -6,25 +6,25 @@
 
 단일 파일:
     python /workspace/alpamayo_dataset/visualize_sample.py \\
-        /workspace/alpamayo_dataset/data/collected/030c760c-...h5
+        /workspace/alpamayo_dataset/data/prepare/train/030c760c-...h5
 
     # 출력 경로 지정
     python /workspace/alpamayo_dataset/visualize_sample.py \\
-        /workspace/alpamayo_dataset/data/collected/030c760c-...h5 \\
+        /workspace/alpamayo_dataset/data/prepare/train/030c760c-...h5 \\
         --output /tmp/viz.png
 
 폴더 전체:
     python /workspace/alpamayo_dataset/visualize_sample.py \\
-        --dir /workspace/alpamayo_dataset/data/collected
+        --dir /workspace/alpamayo_dataset/data/prepare/train
 
     # 출력 디렉토리 별도 지정
     python /workspace/alpamayo_dataset/visualize_sample.py \\
-        --dir /workspace/alpamayo_dataset/data/collected \\
+        --dir /workspace/alpamayo_dataset/data/prepare/train \\
         --output-dir /workspace/alpamayo_dataset/data/viz
 
     # 이미 생성된 PNG도 덮어쓰기
     python /workspace/alpamayo_dataset/visualize_sample.py \\
-        --dir /workspace/alpamayo_dataset/data/collected \\
+        --dir /workspace/alpamayo_dataset/data/prepare/train \\
         --overwrite
 """
 
