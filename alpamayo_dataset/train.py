@@ -67,12 +67,20 @@ from model import CotendMLP, PREDICT_IDX, W_NAMES, N_OUT, LOG_MIN, LOG_MAX
 # Dataset 로딩 워커 (모듈 top-level 필수 — ProcessPoolExecutor 피클링)
 # ══════════════════════════════════════════════════════
 
-def _load_one(path_str: str):
-    """h5 파일 하나를 읽어 (cotend, theta, max_lat) 반환. 실패 또는 valid=False 시 None."""
+def _load_one(path_str: str, vla_gt_thresh: float = float("inf")):
+    """h5 파일 하나를 읽어 (cotend, theta, max_lat) 반환.
+    실패 / valid=False / VLA-GT ADE 초과 시 None.
+    """
     try:
         with h5py.File(path_str, "r") as f:
             if not bool(f["labels/valid"][()]):
                 return None
+            if vla_gt_thresh < float("inf"):
+                pred_xy = f["output/pred_xyz"][:20, :2].astype(np.float64)
+                gt_xy   = f["gt/future_xyz"][:20, :2].astype(np.float64)
+                vla_ade = float(np.mean(np.linalg.norm(pred_xy - gt_xy, axis=1)))
+                if vla_ade > vla_gt_thresh:
+                    return None
             cotend  = f["output/cotend_hidden_state"][:].astype(np.float32)
             w       = f["labels/mpc_weights"][:]
             lat_y   = f["gt/future_xyz"][:20, 1]
@@ -97,9 +105,10 @@ class CotendDataset(Dataset):
     """
 
     def __init__(self, split_dir: Path, cache_dir: Path, name: str = "",
-                 rebuild_cache: bool = False):
+                 rebuild_cache: bool = False, vla_gt_thresh: float = float("inf")):
         label      = f"[{name}]" if name else ""
-        cache_path = cache_dir / f"_mlp_cache_{name}.npz"
+        thresh_tag = f"_vgt{vla_gt_thresh:.2f}" if vla_gt_thresh < float("inf") else ""
+        cache_path = cache_dir / f"_mlp_cache_{name}{thresh_tag}.npz"
 
         # ── 캐시 히트 ──────────────────────────────────────
         if cache_path.exists() and not rebuild_cache:
@@ -121,7 +130,7 @@ class CotendDataset(Dataset):
         cotends, thetas, max_lats = [], [], []
         skipped = 0
         for path_str in (str(p) for p in h5_files):
-            r = _load_one(path_str)
+            r = _load_one(path_str, vla_gt_thresh)
             if r is None:
                 skipped += 1
             else:
@@ -254,7 +263,7 @@ def main():
     parser.add_argument("--dropout",      type=float, default=0.2)
     parser.add_argument("--hidden",       type=int,   nargs="+",
                         help="히든 레이어 크기 (default: 1024 256)")
-    parser.add_argument("--patience",     type=int,   default=40)
+    parser.add_argument("--patience",     type=int,   default=30)
     parser.add_argument("--seed",         type=int,   default=42)
     parser.add_argument("--compile",      action="store_true",
                         help="torch.compile (Linux + PyTorch 2.0+, Windows 불가)")
@@ -265,6 +274,9 @@ def main():
                         help="lateral/longitudinal 균형 샘플링 (WeightedRandomSampler)")
     parser.add_argument("--lat-thresh",   type=float, default=1.0,
                         help="lateral 판별 임계값: max(|GT_y[:20]|) [m] (default: 1.0)")
+    parser.add_argument("--vla-gt-thresh", type=float, default=float("inf"),
+                        help="VLA 예측-GT ADE 상한 [m] (default: inf=필터없음). "
+                             "이 값 초과 시 해당 샘플 제외 (인과성 불일치 필터)")
     args = parser.parse_args()
 
     if args.hidden is None:
@@ -291,12 +303,17 @@ def main():
     # ── 데이터 로드 ────────────────────────────────────
     print("\n데이터 로드 중...")
     t0 = time.perf_counter()
+    if args.vla_gt_thresh < float("inf"):
+        print(f"  VLA-GT 인과성 필터: ADE < {args.vla_gt_thresh:.2f} m")
     train_ds = CotendDataset(data_dir / "train", cache_dir=data_dir,
-                             name="train", rebuild_cache=args.rebuild_cache)
+                             name="train", rebuild_cache=args.rebuild_cache,
+                             vla_gt_thresh=args.vla_gt_thresh)
     val_ds   = CotendDataset(data_dir / "val",   cache_dir=data_dir,
-                             name="val",   rebuild_cache=args.rebuild_cache)
+                             name="val",   rebuild_cache=args.rebuild_cache,
+                             vla_gt_thresh=args.vla_gt_thresh)
     test_ds  = CotendDataset(data_dir / "test",  cache_dir=data_dir,
-                             name="test",  rebuild_cache=args.rebuild_cache)
+                             name="test",  rebuild_cache=args.rebuild_cache,
+                             vla_gt_thresh=args.vla_gt_thresh)
     print(f"  로드 완료: {time.perf_counter()-t0:.1f}s")
 
     n_train, n_val, n_test = len(train_ds), len(val_ds), len(test_ds)

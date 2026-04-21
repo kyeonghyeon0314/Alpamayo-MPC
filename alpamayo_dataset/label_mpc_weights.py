@@ -473,10 +473,7 @@ class MPCLabeler:
                 grad[i] = (self.rollout_ade(th_h) - val) / eps
             return val, grad
 
-        theta_init = np.clip(
-            theta_prev if theta_prev is not None else THETA0,
-            _THETA_MIN, _THETA_MAX,
-        )
+        theta_init = np.clip(THETA0, _THETA_MIN, _THETA_MAX)
         res = scipy.optimize.minimize(
             _obj,
             theta_init,
