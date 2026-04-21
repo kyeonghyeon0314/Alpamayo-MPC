@@ -233,7 +233,7 @@ def _parse_args() -> argparse.Namespace:
         help="이미 존재하는 샘플도 재수집",
     )
     p.add_argument(
-        "--download-workers", type=int, default=2, metavar="N",
+        "--download-workers", type=int, default=1, metavar="N",
     )
     p.add_argument(
         "--prefetch", type=int, default=8, metavar="N",

@@ -26,6 +26,7 @@ AlpamayoDatasetCollector.collect() 내부 처리 순서
 
 from __future__ import annotations
 
+import gc
 import logging
 from pathlib import Path
 
@@ -196,6 +197,11 @@ class AlpamayoDatasetCollector:
                 )
             )
 
+        # 추론 완료 후 카메라 이미지 텐서 즉시 해제 (viz 비활성화 시)
+        # image_frames는 모델 입력 구성에만 쓰이므로 이후엔 불필요
+        if not self._do_viz:
+            raw.pop("image_frames", None)
+
         # 2. AlpamayoSample 구성 (카메라 이미지 포함 — 시각화에 사용 후 h5에는 저장 안 함)
         sample = self._build_sample(raw, pred_xyz, pred_rot, extra)
 
@@ -229,6 +235,7 @@ class AlpamayoDatasetCollector:
         log.info("        → %s", out_path.name)
 
         torch.cuda.empty_cache()
+        gc.collect()
         return out_path
 
     # ------------------------------------------------------------------
@@ -313,10 +320,14 @@ class AlpamayoDatasetCollector:
             cotend_hs = np.zeros(4096, dtype=np.float32)
 
         # --- D. 카메라 (시각화 전용, h5 미저장) ---
-        camera_images = raw["image_frames"].cpu().numpy()           # (N_cam, N_frm, 3, H, W)
-        camera_indices = raw["camera_indices"].cpu().numpy()
-        camera_ids = [_CAMERA_IDX_TO_NAME.get(int(i), f"camera_{i}") for i in camera_indices]
-        frame_ts = raw["absolute_timestamps"].cpu().numpy().astype(np.int64)
+        # viz 비활성화 시 image_frames는 이미 pop됨 → None으로 채움
+        if "image_frames" in raw:
+            camera_images  = raw["image_frames"].cpu().numpy()      # (N_cam, N_frm, 3, H, W)
+            camera_indices = raw["camera_indices"].cpu().numpy()
+            camera_ids     = [_CAMERA_IDX_TO_NAME.get(int(i), f"camera_{i}") for i in camera_indices]
+            frame_ts       = raw["absolute_timestamps"].cpu().numpy().astype(np.int64)
+        else:
+            camera_images = camera_ids = frame_ts = None
 
         return AlpamayoSample(
             clip_id=raw["clip_id"],

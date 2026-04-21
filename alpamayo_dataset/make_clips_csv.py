@@ -154,6 +154,11 @@ def _parse_args() -> argparse.Namespace:
         metavar="DIR",
         help="이미 수집된 .h5 파일이 있는 디렉토리. 해당 (clip_id, t0_us)는 CSV에서 제외",
     )
+    p.add_argument(
+        "--append",
+        action="store_true",
+        help="출력 CSV가 이미 존재하면 덮어쓰지 않고 새 행만 추가",
+    )
 
     return p.parse_args()
 
@@ -221,39 +226,54 @@ def main() -> None:
     t0_values = list(range(t0_start, t0_end + 1, args.t0_step))
     print(f"t0_us 시점:         {[f'{t/1e6:.1f}s' for t in t0_values]}")
 
-    # ── 이미 수집된 샘플 파악 ─────────────────────────────────────────────────
-    existing: set[tuple[str, int]] = set()
+    # ── 제외 대상 수집 ────────────────────────────────────────────────────────
+    excluded: set[tuple[str, int]] = set()
+
+    # 1) 이미 수집된 h5 파일
     if args.skip_existing:
         collected_dir = pathlib.Path(args.skip_existing)
         for h5 in collected_dir.glob("*.h5"):
-            # 파일명 형식: {clip_id}__{t0_us}.h5
             parts = h5.stem.split("__")
             if len(parts) == 2:
                 try:
-                    existing.add((parts[0], int(parts[1])))
+                    excluded.add((parts[0], int(parts[1])))
                 except ValueError:
                     pass
-        print(f"기존 수집 샘플 수:  {len(existing):,}  (제외 예정)")
+        print(f"기존 수집 샘플 수:  {len(excluded):,}  (제외 예정)")
+
+    # 2) --append: 기존 CSV에 이미 있는 행
+    output_path = pathlib.Path(args.output)
+    append_mode = args.append and output_path.exists()
+    if append_mode:
+        with open(output_path, newline="") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                try:
+                    excluded.add((row["clip_id"], int(row["t0_us"])))
+                except (KeyError, ValueError):
+                    pass
+        print(f"기존 CSV 행 수:     {len(excluded):,}  (중복 제외)")
 
     # ── CSV 생성: 클립 단위로 묶인 순서 ──────────────────────────────────────
-    # clip_A, t0=2s → clip_A, t0=4s → clip_A, t0=6s → clip_B, t0=2s → ...
     rows = []
     for clip_id in valid_clips:
         for t0_us in t0_values:
-            if (clip_id, t0_us) not in existing:
+            if (clip_id, t0_us) not in excluded:
                 rows.append({"clip_id": clip_id, "t0_us": t0_us})
 
-    output_path = pathlib.Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(output_path, "w", newline="") as f:
+    write_mode = "a" if append_mode else "w"
+    with open(output_path, write_mode, newline="") as f:
         writer = csv.DictWriter(f, fieldnames=["clip_id", "t0_us"])
-        writer.writeheader()
+        if not append_mode:
+            writer.writeheader()
         writer.writerows(rows)
 
     skipped = len(valid_clips) * len(t0_values) - len(rows)
-    print(f"\n생성 완료: {len(rows):,}개 샘플 → {output_path}")
+    action = "추가 완료" if append_mode else "생성 완료"
+    print(f"\n{action}: {len(rows):,}개 샘플 → {output_path}")
     if skipped:
-        print(f"  (기존 수집분 {skipped:,}개 제외)")
+        print(f"  (중복 {skipped:,}개 제외)")
     print(f"\n수집 명령:")
     print(f"  python /workspace/collect_dataset.py \\")
     print(f"      --csv {output_path} \\")
